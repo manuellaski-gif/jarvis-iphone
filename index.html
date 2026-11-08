@@ -72,7 +72,7 @@ button:disabled{opacity:.55}
   </section>
 
   <form class="controls" id="form">
-    <input id="command" placeholder="Was soll ich tun, Boss?" aria-label="Befehl" autocomplete="off">
+    <input id="command" placeholder="Was soll ich tun, Boss?" aria-label="Befehl" autocomplete="off" maxlength="2000">
     <button type="submit" aria-label="Senden">➤</button>
     <button type="button" class="mic" id="mic" aria-label="Sprachbefehl">🎙</button>
   </form>
@@ -88,7 +88,8 @@ button:disabled{opacity:.55}
 </main>
 
 <script>
-const API = "https://jarvis-iphone-qxi0.onrender.com";
+const localHost = ["localhost", "127.0.0.1", "[::1]", "::1"].includes(window.location.hostname);
+const API = localHost ? "" : "https://jarvis-iphone-qxi0.onrender.com";
 const input = document.querySelector("#command");
 const reply = document.querySelector("#reply");
 const headline = document.querySelector("#headline");
@@ -97,8 +98,30 @@ const loginPanel = document.querySelector("#loginPanel");
 const passwordInput = document.querySelector("#password");
 const loginButton = document.querySelector("#loginButton");
 const loginNote = document.querySelector("#loginNote");
+const commandButtons = document.querySelectorAll("#form button, [data-cmd]");
+const micButton = document.querySelector("#mic");
 
-let token = sessionStorage.getItem("jarvis_session") || "";
+function storedToken() {
+  try {
+    return sessionStorage.getItem("jarvis_session") || "";
+  } catch {
+    return "";
+  }
+}
+
+function storeToken(value) {
+  try {
+    if (value) sessionStorage.setItem("jarvis_session", value);
+    else sessionStorage.removeItem("jarvis_session");
+  } catch {
+    // Chat still works in this tab when browser storage is unavailable.
+  }
+}
+
+let token = storedToken();
+let loginBusy = false;
+let chatBusy = false;
+let listening = false;
 
 function setLoginState(loggedIn) {
   loginPanel.hidden = loggedIn;
@@ -106,41 +129,89 @@ function setLoginState(loggedIn) {
   headline.textContent = loggedIn ? "Bereit für deine Befehle" : "JARVIS gesperrt";
 }
 
+function updateControls() {
+  const busy = loginBusy || chatBusy;
+  loginButton.disabled = busy;
+  passwordInput.disabled = loginBusy;
+  input.disabled = busy;
+  commandButtons.forEach(button => { button.disabled = busy; });
+  micButton.disabled = busy || listening;
+}
+
 function speak(text) {
-  if (!("speechSynthesis" in window)) return;
-  speechSynthesis.cancel();
-  const utterance = new SpeechSynthesisUtterance(text);
-  utterance.lang = "de-DE";
-  utterance.rate = 0.94;
-  utterance.pitch = 1.08;
-  speechSynthesis.speak(utterance);
+  try {
+    if (!("speechSynthesis" in window)) return;
+    const synth = window.speechSynthesis;
+    synth.cancel();
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.lang = "de-DE";
+    utterance.rate = 0.94;
+    utterance.pitch = 1.08;
+    synth.speak(utterance);
+  } catch {
+    // Speech is optional; keep a successful text response visible.
+  }
+}
+
+async function apiRequest(path, options) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 45000);
+  try {
+    const response = await fetch(API + path, {
+      ...options,
+      signal: controller.signal
+    });
+    let data;
+    try {
+      data = await response.json();
+    } catch (error) {
+      if (controller.signal.aborted) throw error;
+    }
+    if (!data || typeof data !== "object" || Array.isArray(data)) {
+      if (response.ok) {
+        throw new Error("Der Server hat keine gültige Antwort gesendet.");
+      }
+      data = {};
+    }
+    return { response, data };
+  } catch (error) {
+    if (controller.signal.aborted) {
+      throw new Error("Der Server antwortet nicht rechtzeitig. Bitte erneut versuchen.");
+    }
+    if (error.name === "TypeError") {
+      throw new Error("Server nicht erreichbar. Bitte erneut versuchen.");
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 async function login() {
+  if (loginBusy || chatBusy) return;
   const password = passwordInput.value;
   if (!password) {
     loginNote.textContent = "Bitte gib dein Passwort ein.";
     return;
   }
 
-  loginButton.disabled = true;
+  loginBusy = true;
+  updateControls();
   loginNote.textContent = "Anmeldung wird geprüft …";
 
   try {
-    const response = await fetch(API + "/api/login", {
+    const { response, data } = await apiRequest("/api/login", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify({password})
     });
 
-    const data = await response.json();
-
-    if (!response.ok || !data.token) {
+    if (!response.ok || typeof data.token !== "string" || !data.token) {
       throw new Error(data.error || "Anmeldung fehlgeschlagen.");
     }
 
     token = data.token;
-    sessionStorage.setItem("jarvis_session", token);
+    storeToken(token);
     passwordInput.value = "";
     loginNote.textContent = "";
     setLoginState(true);
@@ -150,31 +221,47 @@ async function login() {
     loginNote.textContent = error.message ||
       "Server nicht erreichbar. Bitte erneut versuchen.";
   } finally {
-    loginButton.disabled = false;
+    loginBusy = false;
+    updateControls();
   }
 }
 
 loginButton.addEventListener("click", login);
 passwordInput.addEventListener("keydown", event => {
-  if (event.key === "Enter") login();
+  if (event.key === "Enter") {
+    event.preventDefault();
+    login();
+  }
 });
 
 async function answer(command) {
-  const q = command.toLowerCase().trim();
+  if (loginBusy || chatBusy) return;
+  const q = command.toLowerCase().trim().replace(/\s+/g, " ");
+  if (!q) return;
 
-  if (/uhr|wie spät|zeit/.test(q)) {
+  if (/^(?:uhrzeit|uhr|wie spät(?: ist es)?|wie viel uhr(?: ist es)?)[?!.]*$/u.test(q)) {
     const message = "Boss, es ist " +
       new Date().toLocaleTimeString("de-CH", {
         hour: "2-digit", minute: "2-digit"
       }) + " Uhr.";
     reply.textContent = message;
+    headline.textContent = "Antwort bereit";
     speak(message);
     return;
   }
 
-  if (/öffne google|google öffnen/.test(q)) {
+  if (/^(?:öffne google|google öffnen)[?!.]*$/u.test(q)) {
     window.open("https://www.google.com/", "_blank", "noopener,noreferrer");
     reply.textContent = "Ich öffne Google, Boss.";
+    headline.textContent = "Befehl verarbeitet";
+    speak(reply.textContent);
+    return;
+  }
+
+  if (/^(?:öffne (?:den )?kalender|kalender öffnen)[?!.]*$/u.test(q)) {
+    window.open("https://calendar.google.com/", "_blank", "noopener,noreferrer");
+    reply.textContent = "Ich öffne Google Kalender im Browser, Boss.";
+    headline.textContent = "Befehl verarbeitet";
     speak(reply.textContent);
     return;
   }
@@ -185,11 +272,13 @@ async function answer(command) {
     return;
   }
 
+  chatBusy = true;
+  updateControls();
   headline.textContent = "JARVIS denkt nach …";
   reply.textContent = "Einen Moment, Boss …";
 
   try {
-    const response = await fetch(API + "/api/chat", {
+    const { response, data } = await apiRequest("/api/chat", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -198,32 +287,35 @@ async function answer(command) {
       body: JSON.stringify({message: command})
     });
 
-    const data = await response.json();
-
     if (response.status === 401) {
       token = "";
-      sessionStorage.removeItem("jarvis_session");
+      storeToken("");
       setLoginState(false);
       loginNote.textContent = "Bitte melde dich erneut an.";
       throw new Error("Deine Sitzung ist abgelaufen.");
     }
 
     if (!response.ok) {
-      throw new Error(data.error || "KI-Anfrage fehlgeschlagen.");
+      throw new Error(data.error || "KI-Anfrage fehlgeschlagen. Bitte erneut versuchen.");
     }
 
-    reply.textContent = data.reply || "Keine Antwort erhalten.";
+    reply.textContent = typeof data.reply === "string" && data.reply.trim()
+      ? data.reply : "Keine Antwort erhalten.";
     headline.textContent = "Antwort bereit";
     speak(reply.textContent);
   } catch (error) {
     reply.textContent = error.message ||
       "Verbindung zum JARVIS-Server fehlgeschlagen.";
     headline.textContent = "Verbindung prüfen";
+  } finally {
+    chatBusy = false;
+    updateControls();
   }
 }
 
 document.querySelector("#form").addEventListener("submit", event => {
   event.preventDefault();
+  if (loginBusy || chatBusy) return;
   const command = input.value.trim();
   if (!command) return;
   input.value = "";
@@ -231,17 +323,11 @@ document.querySelector("#form").addEventListener("submit", event => {
 });
 
 document.querySelectorAll("[data-cmd]").forEach(button => {
-  button.addEventListener("click", () => {
-    const command = button.dataset.cmd;
-    if (/kalender/i.test(command)) {
-      window.open("https://calendar.google.com/", "_blank", "noopener,noreferrer");
-      return;
-    }
-    answer(command);
-  });
+  button.addEventListener("click", () => answer(button.dataset.cmd));
 });
 
-document.querySelector("#mic").addEventListener("click", () => {
+micButton.addEventListener("click", () => {
+  if (loginBusy || chatBusy || listening) return;
   const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
 
   if (!Recognition) {
@@ -249,26 +335,42 @@ document.querySelector("#mic").addEventListener("click", () => {
     return;
   }
 
-  const recognition = new Recognition();
-  recognition.lang = "de-DE";
-  recognition.interimResults = false;
-  headline.textContent = "Ich höre zu …";
+  try {
+    const recognition = new Recognition();
+    recognition.lang = "de-DE";
+    recognition.interimResults = false;
+    listening = true;
+    updateControls();
+    headline.textContent = "Ich höre zu …";
 
-  recognition.onresult = event => {
-    const command = event.results[0][0].transcript;
-    input.value = command;
-    answer(command);
-  };
+    recognition.onresult = event => {
+      const command = event.results[0][0].transcript;
+      input.value = command;
+      answer(command);
+    };
 
-  recognition.onerror = () => {
+    recognition.onerror = () => {
+      headline.textContent = "Mikrofon nicht verfügbar";
+      reply.textContent = "Bitte prüfe deine Mikrofonberechtigung.";
+    };
+
+    recognition.onend = () => {
+      listening = false;
+      updateControls();
+    };
+
+    recognition.start();
+  } catch {
+    listening = false;
+    updateControls();
     headline.textContent = "Mikrofon nicht verfügbar";
-    reply.textContent = "Bitte prüfe deine Mikrofonberechtigung.";
-  };
-
-  recognition.start();
+    reply.textContent = "Spracherkennung konnte nicht gestartet werden. Bitte tippe deinen Befehl ein.";
+  }
 });
 
-setLoginState(false);
+setLoginState(Boolean(token));
+if (token) reply.textContent = "Sitzung wiederhergestellt. Ich bin bereit, Boss.";
+updateControls();
 </script>
 </body>
 </html>
