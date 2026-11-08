@@ -4,9 +4,18 @@ import OpenAI from "openai";
 import crypto from "node:crypto";
 
 const app = express();
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY
+const groqApiKey = process.env.GROQ_API_KEY?.trim();
+if (!groqApiKey) {
+  throw new Error("GROQ_API_KEY fehlt.");
+}
+
+const groq = new OpenAI({
+  apiKey: groqApiKey,
+  baseURL: "https://api.groq.com/openai/v1",
+  timeout: 30000,
+  maxRetries: 1
 });
+const groqModel = process.env.GROQ_MODEL?.trim() || "llama-3.3-70b-versatile";
 
 const password = process.env.JARVIS_PASSWORD;
 const sessions = new Map();
@@ -104,8 +113,8 @@ app.post("/api/chat", async (req, res) => {
   }
 
   try {
-    const response = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
+    const response = await groq.chat.completions.create({
+      model: groqModel,
       messages: [
         {
           role: "system",
@@ -122,7 +131,7 @@ app.post("/api/chat", async (req, res) => {
         "Keine Antwort erhalten."
     });
   } catch (error) {
-    console.error("JARVIS API error:", error.message);
+    console.error("JARVIS Groq API error:", { status: error.status });
     res.status(500).json({
       error: "KI-Anfrage fehlgeschlagen."
     });
