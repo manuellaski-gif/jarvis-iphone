@@ -58,6 +58,7 @@ HTML-Datei unter `/app` aus, nicht das Projektverzeichnis.
 - Mikrofon und Sprachausgabe auf einem echten iPhone/Safari wurden nicht getestet.
 - Zugangsdaten und bestehende Server-/Hosting-Einstellungen wurden nicht geändert.
   `main` bleibt unverändert. Kein Deployment wurde durchgeführt.
-- Der Versuch, den separaten Branch auf GitHub anzulegen, wurde weiterhin mit
-  `403 Resource not accessible by integration` abgewiesen. Der vollständige Stand
-  ist lokal als Git-Branch und als übertragbarer Patch gesichert.
+- Bei der ersten Vorbereitung fehlte die GitHub-App-Installation; Schreibzugriffe
+  wurden mit `403 Resource not accessible by integration` abgewiesen. Die
+  Installation für das bestehende Repository ist inzwischen bestätigt. Der Stand
+  bleibt auf dem separaten Arbeitsbranch und als übertragbarer Patch gesichert.
