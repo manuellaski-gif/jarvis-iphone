@@ -7,7 +7,8 @@ Anmeldung und KI-Anfragen. API-Schlüssel bleiben ausschließlich auf dem Server
 
 - `index.html`: aktive Oberfläche mit Texteingabe, Anmeldung und optionaler Sprache.
 - `index 2.html`: älterer Offline-Prototyp ohne KI; bleibt als Bestand erhalten.
-- `server.js`: `/api/login`, `/api/chat`, Status unter `/` und Oberfläche unter `/app`.
+- `server.js`: Anmeldung, Chat, geschützte Sprachausgabe, Status unter `/` und Oberfläche unter `/app`.
+- `speech.js`: natürliche Gemini-Stimme mit fortlaufender Audioausgabe und kurzem RAM-Cache.
 - `.env.example`: leere Vorlagen und optionale Konfiguration, keine Zugangsdaten.
 - `test/`: automatisierte Server- und Frontend-Regressionstests ohne echte KI-Aufrufe.
 
@@ -40,7 +41,9 @@ von Groq und Google Gemini. Ein zusätzliches SDK ist nicht erforderlich.
 | `OPENAI_API_KEY` | Bestehender OpenAI-Schlüssel bleibt weiterhin nutzbar. |
 | `OPENAI_MODEL` | Optional, Standard `gpt-4o-mini`. |
 | `GEMINI_API_KEY` | Gemini-Schlüssel, ausschließlich serverseitig hinterlegen. |
-| `GEMINI_MODEL` | Optional, Standard `gemini-3.8-flash`. |
+| `GEMINI_MODEL` | Optional, Standard `gemini-3.5-flash-lite` für kurze Antwortzeiten. |
+| `GEMINI_TTS_MODEL` | Optional, Standard `gemini-3.8-flash-lite-tts`. |
+| `GEMINI_VOICE` | Optional, Standard `Sulafat` (warme Stimme). |
 | `JARVIS_PASSWORD` | Bestehendes Passwort, 16 bis 256 Zeichen. |
 | `ALLOWED_ORIGINS` | Optional, erlaubte Browser-Ursprünge, durch Kommas getrennt. Standard: `https://manuellaski-gif.github.io`. |
 | `TRUST_PROXY` | Zahl vertrauenswürdiger Proxy-Hops, Standard `0`. |
@@ -62,7 +65,7 @@ automatischen Anbieterwechsel bei Fehlern während einer Anfrage.
    Variable aktiviert sie noch nicht im laufenden Prozess. Ein älterer Build
    ohne Gemini-Unterstützung kann `AI_PROVIDER=gemini` nicht verarbeiten.
 
-`gemini-3.8-flash` wird in der zum Implementierungszeitpunkt geprüften
+`gemini-3.5-flash-lite` wird in der zum Implementierungszeitpunkt geprüften
 [Google-Preisliste](https://aistudio.google.com/docs/pricing) mit kostenlosem
 Kontingent für Ein- und Ausgabetokens geführt. Modellzugang und Kontolimits
 müssen im eigenen Google-Konto verfügbar sein. Eine bezahlte Abrechnung wird
@@ -72,6 +75,50 @@ durch diesen Code nicht eingerichtet. Der Server verwendet den dokumentierten
 Wenn zusätzlich noch ein OpenAI-Schlüssel existiert, ist die explizite Vorgabe
 `AI_PROVIDER=gemini` erforderlich, um Gemini zu wählen. So bleibt das Verhalten
 bereits bestehender OpenAI-Installationen unverändert.
+
+### Schnelle Antworten und natürliche Sprache
+
+„Hilfe“, Datum und Uhrzeit werden direkt in der Oberfläche beantwortet. Diese
+Befehle benötigen keine KI-Anfrage. Normale KI-Fragen erscheinen bereits während
+der Generierung. Der Server verwendet für das schnelle Standardmodell minimale
+Denkarbeit und bittet normalerweise um zwei bis drei natürliche, kurze Sätze.
+Ein ausdrücklich gesetztes `GEMINI_MODEL` bleibt unterstützt.
+
+Die Stimmeinstellung **Natürlich** verwendet Googles Flash-Lite-Sprachmodell und
+den bereits serverseitig hinterlegten `GEMINI_API_KEY`. Die warme deutsche
+Sprachausgabe wird fortlaufend abgespielt. **Gerätestimme** verwendet auf Wunsch
+eine vorhandene hochwertige deutsche Systemstimme; **Aus** schaltet das Vorlesen
+ab. **Vorlesen** und **Stopp** erlauben manuelle Steuerung. Bei fehlendem Kontingent
+oder Audiofehlern bleibt die Textantwort erhalten. Es wird nicht unbemerkt auf
+eine andere Stimme gewechselt.
+
+Auch `gemini-3.8-flash-lite-tts` hat laut der geprüften
+[Google-Preisliste](https://aistudio.google.com/docs/pricing#gemini-3.8-flash-lite-tts)
+ein kostenloses Standardkontingent. Freigaben und Limits sind projektabhängig.
+Es wird kein zusätzlicher Cloud-TTS-Dienst und keine bezahlte Abrechnung
+eingerichtet. Sprachdaten werden kurz und begrenzt im Server-RAM gepuffert,
+nicht in Dateien oder Logs gespeichert.
+
+**Fünf Sekunden sind ein Ziel für einen bereits laufenden Dienst.** Eine feste
+Obergrenze lässt sich mit dem kostenlosen Hosting nicht zusichern:
+[Render Free](https://render.com/docs/free#spinning-down-on-idle) pausiert Dienste
+nach Inaktivität, und das Aufwachen kann etwa eine Minute dauern. Lokale Befehle
+funktionieren nach dem Laden der Seite weiterhin sofort. Es werden keine
+Hintergrund-Pings eingerichtet und kein kostenpflichtiger Plan aktiviert.
+
+### API-Kompatibilität
+
+`POST /api/chat` liefert weiterhin `{reply}` als JSON. Mit
+`Accept: text/event-stream` sendet der Server `delta`-Ereignisse mit `{text}` und
+abschließend `done` mit `{reply}`. Fehler vor Beginn bleiben JSON-Antworten mit
+HTTP-Status; spätere Fehler sind `error`-Ereignisse. Verbindungsabbrüche brechen
+auch die ausgehende Anfrage ab.
+
+`POST /api/speech` erwartet dieselbe Bearer-Sitzung und `{text}` mit höchstens
+1200 Zeichen. Ohne Streaming erhält der Client WAV; mit SSE erhält er
+`audio`-Ereignisse mit Base64-PCM16LE, 24 kHz, mono, anschließend `done`.
+Die Sprachausgabe hat ein eigenes Limit von fünf Anfragen pro Minute und Sitzung.
+Zeitmessungen in den Logs enthalten nur Anbieter, Modell und Laufzeiten.
 
 Groq bietet je nach Konto ein kostenloses Kontingent mit Anfrage- und Tokenlimits.
 Das ist keine Zusage unbegrenzter kostenloser Nutzung. Vor einer späteren

@@ -19,6 +19,8 @@ Basis: `main` bei `019e9cc0884baabe40df1ed131cb1b2cb5191bec`.
 | Fehlerhafte oder zu große JSON-Anfragen erzeugen HTML-Fehlerseiten. | Einheitliche JSON-Fehlerantworten mit HTTP 400/413. |
 | Nur OpenAI ist fest integriert. | Groq und Gemini sind über das vorhandene SDK nutzbar; die bestehende OpenAI-Konfiguration bleibt unterstützt. Kein zweites SDK. |
 | Lokales Zusammenspiel von Frontend und Server ist nicht vorbereitet; Lockfile und Testbefehl fehlen. | Lokale Oberfläche unter `/app`, Lockfile, Node-Anforderung und `npm test` ergänzt. |
+| „Hilfe“ benötigt eine vollständige KI-Antwort; Antworten werden erst am Ende sichtbar. | Hilfe, Datum und Uhrzeit werden lokal beantwortet; normale Antworten erscheinen per SSE während der Generierung. |
+| Die voreingestellte Gerätestimme klingt je nach iPhone-Stimmenpaket künstlich. | Natürliche deutsche Gemini-Sprachausgabe mit fortlaufendem Audio, separater Gerätestimmen-Option und Stopp/Vorlesen-Steuerung. |
 
 ## Projektstruktur
 
@@ -33,27 +35,37 @@ HTML-Datei unter `/app` aus, nicht das Projektverzeichnis.
 
 ## Verifikation
 
-- `npm test -- --test-reporter=tap`: **33 Tests bestanden**, davon 19 Server-HTTP-
-  und 14 Frontend-Regressionstests. Der tatsächliche SDK-Client verwendet einen
+- `npm test -- --test-reporter=tap`: **71 Tests bestanden**, davon 33 Server-HTTP-,
+  30 Frontend- und 8 Sprachtransporttests. Der tatsächliche SDK-Client verwendet einen
   simulierten ausgehenden Transport; keine echten KI-Anfragen.
 - Gemini wird mit dem dokumentierten OpenAI-kompatiblen Endpunkt und dem
-  Standardmodell `gemini-3.8-flash` getestet. Explizite Anbieterwahl und ein
+  schnelleren Standardmodell `gemini-3.5-flash-lite` getestet. Explizite Anbieterwahl und ein
   anderes konfiguriertes Modell sind abgedeckt; bestehende Groq-/OpenAI-Auswahl
   bleibt bei zusätzlich vorhandenem Gemini-Schlüssel erhalten.
-- Chromium mit mobiler Fenstergröße 390 × 844: Anmeldung, Chat über lokalen
-  Express-Server mit simuliertem Groq-Transport, Zeitmanagement-Frage,
-  Wiederherstellung nach Neuladen, Uhrzeit, HTML/502-Fehler, HTML/401-Abmeldung,
-  wieder nutzbare Bedienelemente, keine horizontale Überbreite und keine
-  JavaScript-Laufzeitfehler bestanden.
+- Der echte lokale Express-Server, SDK und Sprachtransport wurden gemeinsam im
+  mobilen Chromium getestet. Hilfe ohne API-Aufruf, Anmeldung, progressive
+  Textausgabe vor Abschluss, fortlaufende PCM-Wiedergabe, Stopp und Aus-Modus
+  sowie ein Stimmen-Limit bei weiterhin sichtbarer Antwort sind bestanden.
+  Bei 320 und 390 Pixeln Breite keine horizontale Überbreite oder JS-Fehler.
+- Die lokalen Zeitmessungen (Hilfe etwa 99 ms, erster Text etwa 252 ms) enthalten
+  simulierte Anbieter und sind kein Benchmark der echten Gemini-Verbindung.
+- Sprachtests prüfen den dokumentierten TTS-Modellnamen, Stimme und Stil,
+  Audio vor Stream-Abschluss, korrektes WAV, Cache, Abbruch, Timeout und sichere
+  Fehler. Google-Schlüssel wurden nicht ausgelesen oder für diese Tests genutzt.
 - `node --check server.js` und `git diff --check`: bestanden.
 - `npm audit --omit=dev`: keine bekannten Sicherheitslücken gemeldet
   (Momentaufnahme der neu installierten, im Lockfile festgehaltenen Versionen).
 
 ## Offene Punkte und Grenzen
 
-- Echte Groq- und Gemini-Aufrufe wurden ohne passende Zugangsdaten nicht
-  ausgeführt. Kostenloses Kontingent, Modellfreigabe und Limits müssen im
-  jeweiligen Konto verfügbar sein. Die Konfiguration steht in `README.md`.
+- Echte Modell- und Stimmenanfragen sind in dieser Testsuite simuliert.
+  Modellfreigaben und Kontingente müssen im eigenen Google-Konto verfügbar
+  sein. Die natürliche Stimme muss nach Veröffentlichung auf dem persönlichen
+  iPhone angehört werden; die Browserprüfung verwendet synthetisches Audio.
+- Unter fünf Sekunden ist bei einem laufenden Dienst das Optimierungsziel,
+  keine garantierte Obergrenze. Render Free pausiert nach Inaktivität und kann
+  etwa eine Minute zum Aufwachen benötigen. Ein kostenpflichtiger Tarif wurde
+  nicht aktiviert.
 - Vor einem späteren Deployment die Reverse-Proxy-Topologie prüfen und erst dann
   `TRUST_PROXY` setzen. Standardmäßig wird kein weitergeleiteter Client-IP-Header
   vertraut. Eine falsche Einstellung kann Anmeldelimits beeinträchtigen.
@@ -65,9 +77,7 @@ HTML-Datei unter `/app` aus, nicht das Projektverzeichnis.
   veröffentlicht und anhand von HTTP-Antworten, ausgelieferter HTML-Datei,
   mobilen Browserprüfungen und Laufzeitlogs verifiziert. Der manuelle
   Commit-Deploy hat automatische Deployments deaktiviert.
-- Die Gemini-Erweiterung benötigt ein eigenes Deployment und einen privat
-  hinterlegten `GEMINI_API_KEY`. `AI_PROVIDER=gemini` wählt Gemini ausdrücklich;
-  die bestehende OpenAI-Konfiguration wird durch den Code nicht überschrieben.
-- Die letzte beobachtete produktive KI-Anfrage nutzte OpenAI und erhielt HTTP
-  429. Ob ein kurzfristiges Anfragelimit oder ein Kontingentproblem vorliegt,
-  lässt sich aus dem bewusst reduzierten Fehlerlog nicht unterscheiden.
+- Gemini wurde mit einem privat vom Nutzer hinterlegten `GEMINI_API_KEY` und
+  `AI_PROVIDER=gemini` aktiviert. Der Dienst verwendet den separaten Arbeitsbranch;
+  bestehende Passwörter und andere API-Schlüssel wurden nicht verändert.
+  Die neue Sprachausgabe verwendet denselben Schlüssel.

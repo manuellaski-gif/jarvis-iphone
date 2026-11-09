@@ -6,9 +6,10 @@ import vm from "node:vm";
 const html = readFileSync(new URL("../index.html", import.meta.url), "utf8");
 const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
 
-function response(status, body, nonJson = false) {
+function response(status, body, nonJson = false, contentType = "application/json") {
   return {
     status,
+    headers: new Headers({ "Content-Type": contentType }),
     ok: status >= 200 && status < 300,
     async json() {
       if (nonJson) throw new SyntaxError("Unexpected token <");
@@ -18,10 +19,50 @@ function response(status, body, nonJson = false) {
 }
 
 function browser({ token = "", hostname = "manuellaski-gif.github.io", fetchImpl,
-  storageFailures = [], speechFails = false } = {}) {
+  storageFailures = [], speechFails = false, voiceMode = "off", voices = [],
+  audioState = "running", resumeFails = false, decodeAudio } = {}) {
   const elements = new Map();
   const requests = [];
   const opened = [];
+  const utterances = [];
+  const audioContexts = [];
+  const preferences = new Map(voiceMode ? [["jarvis_voice_mode", voiceMode]] : []);
+  class FakeAudioContext {
+    constructor() {
+      this.state = audioState;
+      this.currentTime = 10;
+      this.destination = {};
+      this.sources = [];
+      this.buffers = [];
+      this.resumeCalls = 0;
+      audioContexts.push(this);
+    }
+    resume() {
+      this.resumeCalls += 1;
+      if (resumeFails) return Promise.reject(new Error("Activation required"));
+      this.state = "running";
+      return Promise.resolve();
+    }
+    createBuffer(_channels, length, sampleRate) {
+      const values = new Float32Array(length);
+      const buffer = { duration: length / sampleRate, sampleRate, getChannelData() { return values; } };
+      this.buffers.push(buffer);
+      return buffer;
+    }
+    createBufferSource() {
+      const source = {
+        connect() {},
+        start(time) { this.startTime = time; },
+        stop() { this.stopped = true; }
+      };
+      this.sources.push(source);
+      return source;
+    }
+    decodeAudioData(bytes) {
+      if (decodeAudio) return decodeAudio(bytes);
+      return Promise.resolve(this.createBuffer(1, 24000, 24000));
+    }
+  }
   const timers = new Map();
   const saved = new Map(token ? [["jarvis_session", token]] : []);
   let timerId = 0;
@@ -44,10 +85,12 @@ function browser({ token = "", hostname = "manuellaski-gif.github.io", fetchImpl
   const context = vm.createContext({
     window: {
       location: { hostname },
+      AudioContext: FakeAudioContext,
       open(...args) { opened.push(args); },
       speechSynthesis: {
         cancel() { if (speechFails) throw new Error("Speech unavailable"); },
-        speak() {}
+        speak(utterance) { utterances.push(utterance); },
+        getVoices() { return voices; }
       }
     },
     document: {
@@ -72,6 +115,18 @@ function browser({ token = "", hostname = "manuellaski-gif.github.io", fetchImpl
         saved.delete(key);
       }
     },
+    localStorage: {
+      getItem(key) {
+        if (storageFailures.includes("get")) throw new Error("Storage blocked");
+        return preferences.get(key) ?? null;
+      },
+      setItem(key, value) {
+        if (storageFailures.includes("set")) throw new Error("Storage blocked");
+        preferences.set(key, value);
+      }
+    },
+    TextDecoder,
+    atob,
     fetch: async (url, options) => {
       requests.push({ url, ...options });
       return fetchImpl ? fetchImpl(url, options) : response(200, { reply: "Hallo Boss." });
@@ -84,9 +139,15 @@ function browser({ token = "", hostname = "manuellaski-gif.github.io", fetchImpl
   });
   vm.runInContext(script, context);
   return {
-    element, requests, opened, saved, timers, controls,
+    element, requests, opened, saved, timers, controls, utterances, audioContexts, preferences,
     answer(command) { return vm.runInContext(`answer(${JSON.stringify(command)})`, context); },
-    login() { return vm.runInContext("login()", context); }
+    login() { return vm.runInContext("login()", context); },
+    speak(text) { return vm.runInContext(`speak(${JSON.stringify(text)})`, context); },
+    stop() { return vm.runInContext("stopOutput()", context); },
+    changeVoice(value) {
+      element("voiceMode").value = value;
+      element("voiceMode").listeners.get("change")();
+    }
   };
 }
 
@@ -241,4 +302,251 @@ test("login hosting failures restore controls and show a readable message", asyn
   assert.match(page.element("loginNote").textContent, /Anmeldung fehlgeschlagen/);
   assert.equal(page.element("loginButton").disabled, false);
   assert.equal(page.element("loginPanel").hidden, false);
+});
+
+function sseStream() {
+  let controller;
+  const encoder = new TextEncoder();
+  const body = new ReadableStream({ start(value) { controller = value; } });
+  return {
+    response: new Response(body, { status: 200, headers: { "Content-Type": "text/event-stream" } }),
+    send(event, data) { controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)); },
+    bytes(bytes) { controller.enqueue(bytes); },
+    close() { controller.close(); }
+  };
+}
+
+const nextTurn = () => new Promise(resolve => setImmediate(resolve));
+const audioEvent = bytes => ({ data: Buffer.from(bytes).toString("base64"), sampleRate: 24000, format: "pcm_s16le" });
+
+test("Hilfe, capability, date and clock commands render immediately without login or cloud calls", async () => {
+  const page = browser({ voiceMode: null });
+  for (const command of ["Hilfe", "Was kannst du?", "Datum", "Welcher Tag ist heute?", "Wie spät ist es?"]) {
+    const pending = page.answer(command);
+    assert.notEqual(page.element("reply").textContent, "");
+    assert.equal(page.requests.length, 0);
+    assert.equal(page.element("headline").textContent, "Antwort bereit");
+    await pending;
+  }
+  assert.match(page.element("voiceStatus").textContent, /bitte anmelden/);
+  assert.equal(page.requests.length, 0);
+});
+
+test("natural voice is the default and saved modes survive storage failures", () => {
+  assert.equal(browser({ voiceMode: null }).element("voiceMode").value, "natural");
+  const selected = browser({ voiceMode: "device" });
+  assert.equal(selected.element("voiceMode").value, "device");
+  selected.changeVoice("off");
+  assert.equal(selected.preferences.get("jarvis_voice_mode"), "off");
+  const blocked = browser({ voiceMode: null, storageFailures: ["get", "set"] });
+  blocked.changeVoice("device");
+  assert.match(blocked.element("voiceStatus").textContent, /Gerätestimme/);
+});
+
+test("SSE renders fragmented UTF-8 and CRLF deltas before completion then speaks exactly once", async () => {
+  const stream = sseStream();
+  const page = browser({ token: "session", voiceMode: "device", fetchImpl: () => stream.response });
+  const pending = page.answer("Eine Begrüßung bitte");
+  const bytes = new TextEncoder().encode(': heartbeat\r\n\r\nevent: delta\r\ndata: {"text":"Grüße 👋"}\r\n\r\n');
+  for (const byte of bytes) stream.bytes(new Uint8Array([byte]));
+  await nextTurn();
+  assert.equal(page.element("reply").textContent, "Grüße 👋");
+  assert.equal(page.element("headline").textContent, "JARVIS antwortet …");
+  assert.equal(page.utterances.length, 0);
+  assert.equal(page.element("command").disabled, true);
+  assert.equal(JSON.parse(page.requests[0].body).stream, true);
+  assert.equal(page.requests[0].headers.Accept, "text/event-stream");
+  stream.send("delta", { text: " Boss." });
+  stream.send("done", { reply: "Grüße 👋 Boss." });
+  stream.close();
+  await pending;
+  assert.equal(page.element("reply").textContent, "Grüße 👋 Boss.");
+  assert.equal(page.utterances.length, 1);
+  assert.equal(page.utterances[0].text, "Grüße 👋 Boss.");
+  assert.equal(page.element("command").disabled, false);
+});
+
+test("a failed or incomplete stream preserves partial text without speaking it", async () => {
+  for (const sendError of [true, false]) {
+    const stream = sseStream();
+    const page = browser({ token: "session", voiceMode: "device", fetchImpl: () => stream.response });
+    const pending = page.answer("Eine längere Frage");
+    stream.send("delta", { text: "Bereits sichtbarer Text" });
+    if (sendError) stream.send("error", { error: "Bitte später versuchen.", status: 503 });
+    stream.close();
+    await pending;
+    assert.equal(page.element("reply").textContent, "Bereits sichtbarer Text");
+    assert.equal(page.utterances.length, 0);
+    assert.equal(page.element("command").disabled, false);
+    assert.match(page.element("voiceStatus").textContent, sendError ? /Bitte später/ : /unterbrochen/);
+  }
+});
+
+test("Stop aborts an unfinished chat stream and restores controls", async () => {
+  const stream = sseStream();
+  const page = browser({ token: "session", voiceMode: "device", fetchImpl: () => stream.response });
+  const pending = page.answer("Eine längere Frage");
+  stream.send("delta", { text: "Teilantwort" });
+  await nextTurn();
+  page.stop();
+  await pending;
+  assert.equal(page.requests[0].signal.aborted, true);
+  assert.equal(page.element("reply").textContent, "Teilantwort");
+  assert.equal(page.element("headline").textContent, "Anfrage gestoppt");
+  assert.equal(page.element("command").disabled, false);
+  assert.equal(page.utterances.length, 0);
+});
+
+test("device mode chooses a high-quality German voice with neutral prosody", async () => {
+  const voices = [
+    { name: "English Premium", lang: "en-US", localService: true },
+    { name: "Deutsch", lang: "de-DE", localService: true },
+    { name: "Anna Enhanced", lang: "de-DE", localService: true },
+    { name: "Markus Premium", lang: "de-DE", localService: true }
+  ];
+  const page = browser({ voiceMode: "device", voices });
+  await page.answer("Hilfe");
+  const utterance = page.utterances[0];
+  assert.equal(utterance.voice, voices[3]);
+  assert.equal(utterance.lang, "de-DE");
+  assert.equal(utterance.rate, 1);
+  assert.equal(utterance.pitch, 1);
+  page.changeVoice("off");
+  await page.answer("Hilfe");
+  assert.equal(page.utterances.length, 1);
+});
+
+test("natural streaming schedules PCM chunks consecutively and preserves odd-byte carry", async () => {
+  const stream = sseStream();
+  const page = browser({ token: "session", voiceMode: "natural", fetchImpl: () => stream.response });
+  page.element("reply").textContent = "Die vollständige Textantwort bleibt hier.";
+  const pending = page.speak("Hallo Boss.");
+  stream.send("audio", audioEvent([0, 0, 0]));
+  stream.send("audio", audioEvent([128, 255, 127]));
+  stream.send("done", {});
+  stream.close();
+  await pending;
+  assert.equal(page.requests[0].url, "https://jarvis-iphone-qxi0.onrender.com/api/speech");
+  assert.equal(page.requests[0].headers.Authorization, "Bearer session");
+  assert.equal(page.requests[0].headers.Accept, "text/event-stream");
+  const context = page.audioContexts[0];
+  assert.equal(context.buffers.length, 2);
+  assert.deepEqual([...context.buffers[0].getChannelData(0)], [0]);
+  assert.deepEqual([...context.buffers[1].getChannelData(0)], [-1, 32767 / 32768]);
+  assert.equal(context.sources[0].startTime, 10.12);
+  assert.equal(context.sources[1].startTime, context.sources[0].startTime + context.buffers[0].duration);
+  assert.equal(page.utterances.length, 0);
+  assert.equal(page.element("reply").textContent, "Die vollständige Textantwort bleibt hier.");
+  assert.equal(page.element("stopButton").disabled, false);
+  page.stop();
+  assert.ok(context.sources.every(source => source.stopped));
+});
+
+test("new commands abort pending speech and prevent stale audio from playing", async () => {
+  let finish;
+  const stream = sseStream();
+  const page = browser({ token: "session", voiceMode: "natural", fetchImpl: () => new Promise(resolve => { finish = resolve; }) });
+  const pending = page.speak("Alte Antwort");
+  await nextTurn();
+  assert.equal(page.requests.length, 1);
+  page.changeVoice("off");
+  await page.answer("Hilfe");
+  stream.send("audio", audioEvent([0, 0, 0, 0]));
+  stream.send("done", {});
+  stream.close();
+  finish(stream.response);
+  await pending;
+  assert.equal(page.requests[0].signal.aborted, true);
+  assert.equal(page.audioContexts[0].sources.length, 0);
+  assert.match(page.element("reply").textContent, /Uhrzeit, Datum und Hilfe/);
+});
+
+test("natural quota failure retains text and never silently invokes device speech", async () => {
+  const page = browser({ token: "session", voiceMode: "natural", fetchImpl: () => response(429, { error: "Sprachlimit erreicht. Bitte später erneut versuchen." }) });
+  page.element("reply").textContent = "Antwort bleibt sichtbar";
+  await page.speak("Antwort bleibt sichtbar");
+  assert.equal(page.element("reply").textContent, "Antwort bleibt sichtbar");
+  assert.match(page.element("voiceStatus").textContent, /Sprachlimit erreicht/);
+  assert.equal(page.utterances.length, 0);
+  assert.equal(page.element("stopButton").disabled, true);
+});
+
+test("natural audio supports WAV fallback without blocking the text response", async () => {
+  const wav = new Response(new Uint8Array([82, 73, 70, 70]), { headers: { "Content-Type": "audio/wav" } });
+  const page = browser({ token: "session", voiceMode: "natural", fetchImpl: () => wav });
+  await page.speak("WAV-Antwort");
+  assert.equal(page.audioContexts[0].sources.length, 1);
+  assert.equal(page.utterances.length, 0);
+});
+
+test("blocked iOS audio requests a playback tap without consuming a speech request", async () => {
+  const page = browser({ token: "session", voiceMode: "natural", audioState: "suspended", resumeFails: true });
+  await page.speak("Hallo");
+  assert.match(page.element("voiceStatus").textContent, /Tippe auf Vorlesen/);
+  assert.equal(page.requests.length, 0);
+  assert.equal(page.utterances.length, 0);
+});
+
+test("natural speech is sentence-capped at 1200 while visible text remains complete", async () => {
+  const text = "Ein kurzer erster Satz. " + "Sehr ausführliche Ergänzung ".repeat(70);
+  const page = browser({ token: "session", voiceMode: "natural", fetchImpl: () => response(503, { error: "Gerade nicht verfügbar." }) });
+  page.element("reply").textContent = text;
+  await page.speak(text);
+  const spoken = JSON.parse(page.requests[0].body).text;
+  assert.ok(spoken.length <= 1200);
+  assert.equal(spoken, "Ein kurzer erster Satz.");
+  assert.equal(page.element("reply").textContent, text);
+});
+
+test("a slow speech request does not keep a completed AI reply busy", async () => {
+  const page = browser({ token: "session", voiceMode: "natural", fetchImpl: url => url.endsWith("/api/chat")
+    ? response(200, { reply: "Sofort sichtbarer Text" }) : new Promise(() => {}) });
+  await page.answer("Bitte eine Antwort");
+  assert.equal(page.element("reply").textContent, "Sofort sichtbarer Text");
+  assert.equal(page.element("command").disabled, false);
+  assert.equal(page.element("stopButton").disabled, false);
+  assert.equal(page.requests.length, 2);
+  page.stop();
+});
+
+test("a send gesture resumes AudioContext synchronously before the chat fetch", async () => {
+  let finish;
+  let page;
+  page = browser({ token: "session", voiceMode: "natural", audioState: "suspended", fetchImpl: () => {
+    assert.equal(page.audioContexts[0].resumeCalls, 1);
+    assert.equal(page.audioContexts[0].state, "running");
+    return new Promise(resolve => { finish = resolve; });
+  } });
+  const pending = page.answer("Bitte eine Idee");
+  assert.equal(page.audioContexts[0].resumeCalls, 1);
+  assert.equal(page.requests.length, 1);
+  page.changeVoice("off");
+  finish(response(200, { reply: "Eine Idee" }));
+  await pending;
+});
+
+test("a speech SSE error stops queued audio without changing the answer or using device voice", async () => {
+  const stream = sseStream();
+  const page = browser({ token: "session", voiceMode: "natural", fetchImpl: () => stream.response });
+  page.element("reply").textContent = "Sichtbare Antwort";
+  const pending = page.speak("Sichtbare Antwort");
+  stream.send("audio", audioEvent([0, 0, 0, 0]));
+  stream.send("error", { status: 429, error: "Das Stimmen-Kontingent ist erreicht." });
+  stream.close();
+  await pending;
+  assert.equal(page.element("reply").textContent, "Sichtbare Antwort");
+  assert.match(page.element("voiceStatus").textContent, /Stimmen-Kontingent/);
+  assert.ok(page.audioContexts[0].sources.every(source => source.stopped));
+  assert.equal(page.utterances.length, 0);
+});
+
+test("an expired speech session reopens login while preserving the text answer", async () => {
+  const page = browser({ token: "expired", voiceMode: "natural", fetchImpl: () => response(401, { error: "Bitte erneut anmelden." }) });
+  page.element("reply").textContent = "Sichtbare Antwort";
+  await page.speak("Sichtbare Antwort");
+  assert.equal(page.element("loginPanel").hidden, false);
+  assert.equal(page.saved.has("jarvis_session"), false);
+  assert.equal(page.element("reply").textContent, "Sichtbare Antwort");
+  assert.match(page.element("voiceStatus").textContent, /erneut anmelden/);
+  assert.equal(page.utterances.length, 0);
 });

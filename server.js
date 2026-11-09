@@ -2,9 +2,11 @@ import express from "express";
 import cors from "cors";
 import OpenAI from "openai";
 import crypto from "node:crypto";
+import { once } from "node:events";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { createSpeechService, SpeechError } from "./speech.js";
 
-export function createApp({ env = process.env, fetch: providerFetch } = {}) {
+export function createApp({ env = process.env, fetch: providerFetch, speechFetch } = {}) {
   const provider = env.AI_PROVIDER?.trim().toLowerCase() ||
     (env.GROQ_API_KEY?.trim() ? "groq" : env.OPENAI_API_KEY?.trim() ? "openai" :
       env.GEMINI_API_KEY?.trim() ? "gemini" : "groq");
@@ -22,7 +24,7 @@ export function createApp({ env = process.env, fetch: providerFetch } = {}) {
     gemini: {
       keyName: "GEMINI_API_KEY",
       baseURL: "https://generativelanguage.googleapis.com/v1beta/openai/",
-      model: env.GEMINI_MODEL?.trim() || "gemini-3.8-flash"
+      model: env.GEMINI_MODEL?.trim() || "gemini-3.5-flash-lite"
     }
   };
   if (!Object.hasOwn(providers, provider)) {
@@ -50,6 +52,14 @@ export function createApp({ env = process.env, fetch: providerFetch } = {}) {
     maxRetries: 0,
     ...(providerFetch ? { fetch: providerFetch } : {})
   });
+  const speechModel = env.GEMINI_TTS_MODEL?.trim() || "gemini-3.8-flash-lite-tts";
+  const speech = createSpeechService({
+    apiKey: env.GEMINI_API_KEY?.trim(),
+    model: speechModel,
+    voice: env.GEMINI_VOICE?.trim() || "Sulafat",
+    fetch: speechFetch || globalThis.fetch,
+    timeoutMs: 30000
+  });
   const allowedOrigins = (env.ALLOWED_ORIGINS || "https://manuellaski-gif.github.io")
     .split(",").map(origin => origin.trim()).filter(Boolean);
 
@@ -73,6 +83,68 @@ export function createApp({ env = process.env, fetch: providerFetch } = {}) {
       if (recent.length) attempts.set(ip, recent);
       else attempts.delete(ip);
     }
+  }
+
+  function getSession(req) {
+    const token = req.get("Authorization")?.match(/^Bearer ([a-f0-9]{64})$/i)?.[1];
+    return token && sessions.get(token);
+  }
+
+  function wantsEvents(req) {
+    return (req.get("Accept") || "").split(",")
+      .some(type => type.split(";")[0].trim().toLowerCase() === "text/event-stream");
+  }
+
+  function startEvents(res) {
+    res.set({
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-store, no-transform",
+      "Connection": "keep-alive",
+      "X-Accel-Buffering": "no"
+    });
+    res.flushHeaders();
+  }
+
+  async function sendEvent(res, event, data, signal) {
+    if (signal.aborted || res.destroyed) return;
+    if (!res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)) {
+      await once(res, "drain", { signal });
+    }
+  }
+
+  function requestLifetime(res) {
+    const controller = new AbortController();
+    const onClose = () => {
+      if (!res.writableEnded) controller.abort();
+    };
+    res.on("close", onClose);
+    return {
+      controller,
+      dispose() {
+        res.off("close", onClose);
+        controller.abort();
+      }
+    };
+  }
+
+  async function sendFailure(res, failure, signal) {
+    if (signal.aborted || res.destroyed) return;
+    if (res.headersSent) {
+      await sendEvent(res, "error", { error: failure.message, status: failure.status }, signal);
+      res.end();
+    } else {
+      if (failure.status === 429) res.set("Retry-After", "60");
+      res.status(failure.status).json({ error: failure.message });
+    }
+  }
+
+  function logTiming(started, firstTokenMs, providerName, modelName) {
+    console.info("JARVIS timing:", {
+      provider: providerName,
+      model: modelName,
+      firstTokenMs,
+      totalMs: Math.round(performance.now() - started)
+    });
   }
 
   app.get("/", (req, res) => {
@@ -107,7 +179,7 @@ export function createApp({ env = process.env, fetch: providerFetch } = {}) {
 
     attempts.delete(ip);
     const token = crypto.randomBytes(32).toString("hex");
-    sessions.set(token, { expires: now + 60 * 60 * 1000, requests: [] });
+    sessions.set(token, { expires: now + 60 * 60 * 1000, requests: [], speechRequests: [] });
     res.json({ token });
   });
 
@@ -115,8 +187,7 @@ export function createApp({ env = process.env, fetch: providerFetch } = {}) {
     res.set("Cache-Control", "no-store");
     const now = Date.now();
     prune(now);
-    const token = req.get("Authorization")?.match(/^Bearer ([a-f0-9]{64})$/i)?.[1];
-    const session = token && sessions.get(token);
+    const session = getSession(req);
     if (!session) {
       return res.status(401).json({ error: "Bitte erneut anmelden." });
     }
@@ -133,38 +204,128 @@ export function createApp({ env = process.env, fetch: providerFetch } = {}) {
     }
     session.requests.push(now);
 
+    const started = performance.now();
+    let firstTokenMs = null;
+    const { controller, dispose } = requestLifetime(res);
+    const streaming = wantsEvents(req);
     try {
       const response = await client.chat.completions.create({
         model,
         messages: [
           {
             role: "system",
-            content: "Du bist JARVIS, ein intelligenter persönlicher Assistent. Antworte auf Deutsch, ruhig, elegant und präzise. Sprich den Nutzer gelegentlich mit Boss an. Behaupte niemals, Aktionen ausgeführt zu haben, wenn du sie nicht wirklich ausgeführt hast."
+            content: "Du bist JARVIS, ein persönlicher Assistent. Antworte auf Deutsch in natürlicher, direkter Alltagssprache. Antworte normalerweise in zwei bis drei kurzen Sätzen; werde ausführlicher, wenn der Nutzer darum bittet. Beginne direkt mit der hilfreichen Antwort, ohne Begrüßungsfloskeln oder ständige Anreden. Behaupte niemals, Aktionen ausgeführt zu haben, wenn du sie nicht wirklich ausgeführt hast."
           },
           { role: "user", content: message.trim() }
         ],
-        // Leave room for Gemini's thinking as well as the visible answer.
+        ...(streaming ? { stream: true } : {}),
+        // Keep room for thinking; the fast Flash-Lite model supports minimal effort.
         ...(provider === "gemini"
-          ? { max_tokens: 2048, reasoning_effort: "low" }
+          ? { max_tokens: 2048, reasoning_effort: model === "gemini-3.5-flash-lite" ? "minimal" : "low" }
           : { max_tokens: 400 })
-      });
+      }, { signal: controller.signal });
+
+      if (streaming) {
+        let reply = "";
+        for await (const chunk of response) {
+          if (controller.signal.aborted || res.destroyed) return;
+          const text = chunk.choices?.[0]?.delta?.content;
+          if (typeof text !== "string" || !text) continue;
+          if (firstTokenMs === null) {
+            firstTokenMs = Math.round(performance.now() - started);
+            startEvents(res);
+          }
+          reply += text;
+          await sendEvent(res, "delta", { text }, controller.signal);
+        }
+        if (controller.signal.aborted || res.destroyed) return;
+        if (!reply.trim()) {
+          return await sendFailure(res, {
+            status: 502, message: "Keine KI-Antwort erhalten. Bitte erneut versuchen."
+          }, controller.signal);
+        }
+        await sendEvent(res, "done", { reply }, controller.signal);
+        res.end();
+        return;
+      }
 
       const reply = response.choices?.[0]?.message?.content;
       if (typeof reply !== "string" || !reply.trim()) {
         return res.status(502).json({ error: "Keine KI-Antwort erhalten. Bitte erneut versuchen." });
       }
+      firstTokenMs = Math.round(performance.now() - started);
       res.json({ reply });
     } catch (error) {
-      // Never log upstream response bodies, headers, keys, or the user's message.
-      console.error("JARVIS API error:", { provider, status: error.status, type: error.name });
-      if (error.status === 429) {
-        res.set("Retry-After", "60");
-        return res.status(429).json({ error: "Das KI-Limit ist erreicht. Bitte später erneut versuchen." });
+      const failure = error.status === 429
+        ? { status: 429, message: "Das KI-Limit ist erreicht. Bitte später erneut versuchen." }
+        : error instanceof OpenAI.APIConnectionTimeoutError
+          ? { status: 504, message: "Die KI antwortet zu langsam. Bitte erneut versuchen." }
+          : { status: 503, message: "Der KI-Dienst ist vorübergehend nicht verfügbar. Bitte später erneut versuchen." };
+      await sendFailure(res, failure, controller.signal);
+    } finally {
+      dispose();
+      logTiming(started, firstTokenMs, provider, model);
+    }
+  });
+
+  app.post("/api/speech", async (req, res) => {
+    res.set("Cache-Control", "no-store");
+    const now = Date.now();
+    prune(now);
+    const session = getSession(req);
+    if (!session) return res.status(401).json({ error: "Bitte erneut anmelden." });
+
+    const text = req.body?.text;
+    if (typeof text !== "string" || !text.trim() || text.trim().length > 1200) {
+      return res.status(400).json({ error: "Ungültiger Sprachtext. Bitte 1 bis 1200 Zeichen senden." });
+    }
+    if (!speech.available) {
+      return res.status(503).json({ error: "Die natürliche Sprachausgabe ist noch nicht verfügbar." });
+    }
+    session.speechRequests = session.speechRequests.filter(time => now - time < 60000);
+    if (session.speechRequests.length >= 5) {
+      res.set("Retry-After", String(Math.max(1, Math.ceil((session.speechRequests[0] + 60000 - now) / 1000))));
+      return res.status(429).json({ error: "Bitte eine Minute mit der Sprachausgabe warten." });
+    }
+    session.speechRequests.push(now);
+
+    const started = performance.now();
+    let firstTokenMs = null;
+    let iterator;
+    const { controller, dispose } = requestLifetime(res);
+    try {
+      if (wantsEvents(req)) {
+        iterator = speech.stream(text.trim(), { signal: controller.signal })[Symbol.asyncIterator]();
+        let chunk = await iterator.next();
+        if (controller.signal.aborted || res.destroyed) return;
+        if (chunk.done) {
+          return await sendFailure(res, { status: 502, message: "Keine Sprachausgabe erhalten." }, controller.signal);
+        }
+        firstTokenMs = Math.round(performance.now() - started);
+        startEvents(res);
+        while (!chunk.done) {
+          if (controller.signal.aborted || res.destroyed) return;
+          await sendEvent(res, "audio", {
+            data: chunk.value.toString("base64"), sampleRate: 24000, format: "pcm_s16le"
+          }, controller.signal);
+          chunk = await iterator.next();
+        }
+        await sendEvent(res, "done", {}, controller.signal);
+        res.end();
+      } else {
+        const wav = await speech.synthesize(text.trim(), { signal: controller.signal });
+        if (controller.signal.aborted || res.destroyed) return;
+        firstTokenMs = Math.round(performance.now() - started);
+        res.type("audio/wav").send(wav);
       }
-      if (error instanceof OpenAI.APIConnectionTimeoutError) {
-        return res.status(504).json({ error: "Die KI antwortet zu langsam. Bitte erneut versuchen." });
-      }
-      return res.status(503).json({ error: "Der KI-Dienst ist vorübergehend nicht verfügbar. Bitte später erneut versuchen." });
+    } catch (error) {
+      await sendFailure(res, error instanceof SpeechError
+        ? { status: error.status, message: error.message }
+        : { status: 503, message: "Die Sprachausgabe ist vorübergehend nicht verfügbar." }, controller.signal);
+    } finally {
+      dispose();
+      if (iterator?.return) await iterator.return();
+      logTiming(started, firstTokenMs, "gemini-tts", speechModel);
     }
   });
 

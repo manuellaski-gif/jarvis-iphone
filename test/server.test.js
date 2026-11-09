@@ -17,18 +17,20 @@ function providerResponse(body, status = 200) {
   });
 }
 
-async function start(t, env = {}, upstream = () => providerResponse(completion)) {
+async function start(t, env = {}, upstream = () => providerResponse(completion), speechFetch) {
   const upstreamRequests = [];
   const app = createApp({
     env: { ...baseEnv, ...env },
+    speechFetch,
     fetch: async (input, init) => {
       const request = new Request(input, init);
       upstreamRequests.push({
         url: request.url,
         authorization: request.headers.get("Authorization"),
+        signal: request.signal,
         body: JSON.parse(await request.text())
       });
-      return upstream();
+      return upstream(request);
     }
   });
   const server = app.listen(0, "127.0.0.1");
@@ -153,9 +155,9 @@ test("Gemini alone uses the documented OpenAI-compatible endpoint and default mo
   assert.equal(upstreamRequests.length, 1);
   assert.equal(upstreamRequests[0].url, "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions");
   assert.equal(upstreamRequests[0].authorization, "Bearer synthetic-gemini-test-key");
-  assert.equal(upstreamRequests[0].body.model, "gemini-3.8-flash");
+  assert.equal(upstreamRequests[0].body.model, "gemini-3.5-flash-lite");
   assert.equal(upstreamRequests[0].body.max_tokens, 2048);
-  assert.equal(upstreamRequests[0].body.reasoning_effort, "low");
+  assert.equal(upstreamRequests[0].body.reasoning_effort, "minimal");
   assert.equal(upstreamRequests[0].body.messages[0].role, "system");
   assert.deepEqual(upstreamRequests[0].body.messages[1], { role: "user", content: "Hallo" });
 });
@@ -173,6 +175,18 @@ test("explicit Gemini selection overrides existing keys and supports a custom mo
   assert.equal(upstreamRequests[0].url, "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions");
   assert.equal(upstreamRequests[0].authorization, "Bearer synthetic-selected-gemini-key");
   assert.equal(upstreamRequests[0].body.model, "test-gemini-model");
+  assert.equal(upstreamRequests[0].body.reasoning_effort, "low");
+});
+
+test("explicit Gemini 3.8 model keeps its supported low reasoning level", async t => {
+  const { request, login, upstreamRequests } = await start(t, {
+    AI_PROVIDER: "gemini", GEMINI_API_KEY: "synthetic-gemini-key", GEMINI_MODEL: "gemini-3.8-flash"
+  });
+  const response = await request("/api/chat", { token: await login(), body: { message: "Hallo" } });
+  assert.equal(response.status, 200);
+  await response.json();
+  assert.equal(upstreamRequests[0].body.model, "gemini-3.8-flash");
+  assert.equal(upstreamRequests[0].body.reasoning_effort, "low");
 });
 
 test("explicit provider selection and OpenAI model override take precedence", async t => {
@@ -319,3 +333,311 @@ for (const { name, upstream, status, message } of [
     if (status === 429) assert.equal(response.headers.get("Retry-After"), "60");
   });
 }
+
+function sseData(data) {
+  return `data: ${typeof data === "string" ? data : JSON.stringify(data)}\n\n`;
+}
+
+function textChunk(text) {
+  return { choices: [{ delta: { content: text } }] };
+}
+
+function controlledStream(first, last) {
+  let controller;
+  let finished = false;
+  const encoder = new TextEncoder();
+  const body = new ReadableStream({
+    start(value) {
+      controller = value;
+      controller.enqueue(encoder.encode(first));
+    }
+  });
+  return {
+    response: new Response(body, { headers: { "Content-Type": "text/event-stream" } }),
+    finish() {
+      if (finished) return;
+      finished = true;
+      controller.enqueue(encoder.encode(last));
+      controller.close();
+    },
+    abort() {
+      if (finished) return;
+      finished = true;
+      controller.error(new DOMException("Synthetic cancellation", "AbortError"));
+    }
+  };
+}
+
+async function readRemaining(reader) {
+  let text = "";
+  const decoder = new TextDecoder();
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) return text + decoder.decode();
+    text += decoder.decode(value, { stream: true });
+  }
+}
+
+function parseEvents(text) {
+  return text.split("\n\n").filter(Boolean).map(block => ({
+    event: block.match(/^event: (.+)$/m)?.[1],
+    data: JSON.parse(block.match(/^data: (.+)$/m)[1])
+  }));
+}
+
+test("chat streaming delivers real SDK text deltas before upstream completion", async t => {
+  const stream = controlledStream(
+    sseData({ choices: [{ delta: { role: "assistant" } }] }) + sseData(textChunk("Hallo")),
+    sseData(textChunk(", Boss.")) + sseData("[DONE]")
+  );
+  t.after(() => stream.finish());
+  const { request, login, upstreamRequests } = await start(t, {}, () => stream.response);
+  const response = await request("/api/chat", {
+    token: await login(), body: { message: "Hallo", stream: true }, headers: { Accept: "text/event-stream" }
+  });
+  assert.equal(response.status, 200);
+  assert.match(response.headers.get("Content-Type"), /text\/event-stream/);
+  assert.match(response.headers.get("Cache-Control"), /no-transform/);
+  assert.equal(upstreamRequests[0].body.stream, true);
+  const reader = response.body.getReader();
+  const first = new TextDecoder().decode((await reader.read()).value);
+  assert.deepEqual(parseEvents(first), [{ event: "delta", data: { text: "Hallo" } }]);
+  stream.finish();
+  assert.deepEqual(parseEvents(await readRemaining(reader)), [
+    { event: "delta", data: { text: ", Boss." } },
+    { event: "done", data: { reply: "Hallo, Boss." } }
+  ]);
+});
+
+test("stream body flag alone preserves the existing JSON response contract", async t => {
+  const { request, login, upstreamRequests } = await start(t);
+  const response = await request("/api/chat", {
+    token: await login(), body: { message: "Hallo", stream: true }
+  });
+  assert.match(response.headers.get("Content-Type"), /application\/json/);
+  assert.deepEqual(await response.json(), { reply: "Hallo, Boss." });
+  assert.equal(upstreamRequests[0].body.stream, undefined);
+});
+
+test("stream requests still authenticate and validate before provider work", async t => {
+  const { request, login, upstreamRequests } = await start(t);
+  const unauthorized = await request("/api/chat", {
+    body: { message: "Hallo" }, headers: { Accept: "text/event-stream" }
+  });
+  assert.equal(unauthorized.status, 401);
+  assert.match(unauthorized.headers.get("Content-Type"), /application\/json/);
+  await unauthorized.json();
+  const invalid = await request("/api/chat", {
+    token: await login(), body: { message: " " }, headers: { Accept: "text/event-stream" }
+  });
+  assert.equal(invalid.status, 400);
+  await invalid.json();
+  assert.equal(upstreamRequests.length, 0);
+});
+
+test("stream startup failures retain the correct JSON error status", async t => {
+  const { request, login } = await start(t, {}, () => providerResponse({ error: { message: "private detail" } }, 429));
+  const response = await request("/api/chat", {
+    token: await login(), body: { message: "Hallo" }, headers: { Accept: "text/event-stream" }
+  });
+  assert.equal(response.status, 429);
+  assert.match(response.headers.get("Content-Type"), /application\/json/);
+  assert.equal(response.headers.get("Retry-After"), "60");
+  assert.match((await response.json()).error, /KI-Limit/);
+});
+
+test("chat stream failures after a delta emit safe terminal SSE errors", async t => {
+  const stream = controlledStream(sseData(textChunk("Hallo")), sseData({ error: { message: "private stream detail" } }));
+  t.after(() => stream.finish());
+  const { request, login } = await start(t, {}, () => stream.response);
+  const response = await request("/api/chat", {
+    token: await login(), body: { message: "Hallo" }, headers: { Accept: "text/event-stream" }
+  });
+  const reader = response.body.getReader();
+  await reader.read();
+  stream.finish();
+  const [failure] = parseEvents(await readRemaining(reader));
+  assert.equal(failure.event, "error");
+  assert.equal(failure.data.status, 503);
+  assert.doesNotMatch(failure.data.error, /private stream detail/);
+});
+
+test("disconnecting a chat stream aborts the real SDK request", async t => {
+  const stream = controlledStream(sseData(textChunk("Hallo")), sseData("[DONE]"));
+  let markAborted;
+  const aborted = new Promise(resolve => { markAborted = resolve; });
+  t.after(() => stream.abort());
+  const { request, login } = await start(t, {}, upstream => {
+    upstream.signal.addEventListener("abort", () => { stream.abort(); markAborted(); }, { once: true });
+    return stream.response;
+  });
+  const response = await request("/api/chat", {
+    token: await login(), body: { message: "Hallo" }, headers: { Accept: "text/event-stream" }
+  });
+  const reader = response.body.getReader();
+  await reader.read();
+  await reader.cancel();
+  let timeout;
+  try {
+    await Promise.race([aborted, new Promise((_, reject) => {
+      timeout = setTimeout(() => reject(new Error("Upstream was not aborted on disconnect")), 1000);
+    })]);
+  } finally {
+    clearTimeout(timeout);
+  }
+});
+
+const pcm = Buffer.from([0, 0, 1, 0, 2, 0, 3, 0]);
+function nativeAudio(data = pcm) {
+  return { candidates: [{ content: { parts: [{ inlineData: {
+    mimeType: "audio/L16;codec=pcm;rate=24000", data: data.toString("base64")
+  } }] } }] };
+}
+
+function speechMock(calls, response) {
+  return async (input, init) => {
+    const request = new Request(input, init);
+    calls.push({ url: request.url, signal: request.signal, body: JSON.parse(await request.text()) });
+    if (response) return response(request);
+    if (request.url.includes("streamGenerateContent")) {
+      return new Response(sseData(nativeAudio()), { headers: { "Content-Type": "text/event-stream" } });
+    }
+    return providerResponse(nativeAudio());
+  };
+}
+
+test("speech requires authentication and a configured Gemini key without affecting chat", async t => {
+  const { request, login } = await start(t);
+  const unauthorized = await request("/api/speech", { body: { text: "Hallo" } });
+  assert.equal(unauthorized.status, 401);
+  await unauthorized.json();
+  const token = await login();
+  const unavailable = await request("/api/speech", { token, body: { text: "Hallo" } });
+  assert.equal(unavailable.status, 503);
+  await unavailable.json();
+  const chat = await request("/api/chat", { token, body: { message: "Hallo" } });
+  assert.equal(chat.status, 200);
+  await chat.json();
+});
+
+test("speech validates text before provider calls and returns a WAV to JSON clients", async t => {
+  const calls = [];
+  const { request, login } = await start(t, { GEMINI_API_KEY: "synthetic-speech-key" }, undefined, speechMock(calls));
+  const token = await login();
+  for (const text of [undefined, null, "", " ", 42, {}, "x".repeat(1201)]) {
+    const invalid = await request("/api/speech", { token, body: { text } });
+    assert.equal(invalid.status, 400);
+    await invalid.json();
+  }
+  assert.equal(calls.length, 0);
+  const response = await request("/api/speech", { token, body: { text: "  Hallo  " } });
+  assert.equal(response.status, 200);
+  assert.match(response.headers.get("Content-Type"), /audio\/wav/);
+  const wav = Buffer.from(await response.arrayBuffer());
+  assert.equal(wav.subarray(0, 4).toString(), "RIFF");
+  assert.deepEqual(wav.subarray(44), pcm);
+  assert.equal(calls.length, 1);
+  assert.match(JSON.stringify(calls[0].body), /Hallo/);
+  assert.doesNotMatch(JSON.stringify(calls[0].body), /  Hallo  /);
+});
+
+test("speech SSE exposes PCM audio before synthesis finishes", async t => {
+  const calls = [];
+  const stream = controlledStream(sseData(nativeAudio()), sseData(nativeAudio(Buffer.from([4, 0]))));
+  t.after(() => stream.finish());
+  const { request, login } = await start(t, { GEMINI_API_KEY: "synthetic-speech-key" }, undefined,
+    speechMock(calls, () => stream.response));
+  const response = await request("/api/speech", {
+    token: await login(), body: { text: "Hallo" }, headers: { Accept: "text/event-stream" }
+  });
+  assert.equal(response.status, 200);
+  assert.match(response.headers.get("Content-Type"), /text\/event-stream/);
+  const reader = response.body.getReader();
+  assert.deepEqual(parseEvents(new TextDecoder().decode((await reader.read()).value)), [{
+    event: "audio", data: { data: pcm.toString("base64"), sampleRate: 24000, format: "pcm_s16le" }
+  }]);
+  stream.finish();
+  assert.deepEqual(parseEvents(await readRemaining(reader)), [
+    { event: "audio", data: { data: Buffer.from([4, 0]).toString("base64"), sampleRate: 24000, format: "pcm_s16le" } },
+    { event: "done", data: {} }
+  ]);
+});
+
+test("speech has an independent per-session quota", async t => {
+  const calls = [];
+  const { request, login } = await start(t, { GEMINI_API_KEY: "synthetic-speech-key" }, undefined, speechMock(calls));
+  const token = await login();
+  for (let i = 0; i < 5; i++) {
+    const chat = await request("/api/chat", { token, body: { message: "Hallo" } });
+    assert.equal(chat.status, 200);
+    await chat.json();
+    const speech = await request("/api/speech", { token, body: { text: `Hallo ${i}` } });
+    assert.equal(speech.status, 200);
+    await speech.arrayBuffer();
+  }
+  const blocked = await request("/api/speech", { token, body: { text: "Hallo" } });
+  assert.equal(blocked.status, 429);
+  assert.ok(Number(blocked.headers.get("Retry-After")) > 0);
+  await blocked.json();
+  assert.equal(calls.length, 5);
+});
+
+test("speech upstream errors keep safe JSON status and do not break chat", async t => {
+  const calls = [];
+  const { request, login } = await start(t, { GEMINI_API_KEY: "synthetic-speech-key" }, undefined,
+    speechMock(calls, () => providerResponse({ error: { message: "private voice detail" } }, 429)));
+  const token = await login();
+  const response = await request("/api/speech", {
+    token, body: { text: "Hallo" }, headers: { Accept: "text/event-stream" }
+  });
+  assert.equal(response.status, 429);
+  assert.match(response.headers.get("Content-Type"), /application\/json/);
+  assert.doesNotMatch(JSON.stringify(await response.json()), /private voice detail|synthetic-speech-key/);
+  assert.equal(calls.length, 1);
+  const chat = await request("/api/chat", { token, body: { message: "Hallo" } });
+  assert.equal(chat.status, 200);
+  await chat.json();
+});
+
+test("speech stream errors after audio emit a safe terminal error event", async t => {
+  const stream = controlledStream(sseData(nativeAudio()), sseData({ error: { code: 429, message: "private speech detail" } }));
+  t.after(() => stream.finish());
+  const { request, login } = await start(t, { GEMINI_API_KEY: "synthetic-speech-key" }, undefined,
+    speechMock([], () => stream.response));
+  const response = await request("/api/speech", {
+    token: await login(), body: { text: "Hallo" }, headers: { Accept: "text/event-stream" }
+  });
+  const reader = response.body.getReader();
+  await reader.read();
+  stream.finish();
+  const [failure] = parseEvents(await readRemaining(reader));
+  assert.equal(failure.event, "error");
+  assert.equal(failure.data.status, 429);
+  assert.doesNotMatch(failure.data.error, /private speech detail|synthetic-speech-key/);
+});
+
+test("disconnecting speech audio aborts upstream synthesis", async t => {
+  const stream = controlledStream(sseData(nativeAudio()), "");
+  let markAborted;
+  const aborted = new Promise(resolve => { markAborted = resolve; });
+  t.after(() => stream.abort());
+  const { request, login } = await start(t, { GEMINI_API_KEY: "synthetic-speech-key" }, undefined,
+    speechMock([], upstream => {
+      upstream.signal.addEventListener("abort", () => { stream.abort(); markAborted(); }, { once: true });
+      return stream.response;
+    }));
+  const response = await request("/api/speech", {
+    token: await login(), body: { text: "Hallo" }, headers: { Accept: "text/event-stream" }
+  });
+  const reader = response.body.getReader();
+  await reader.read();
+  await reader.cancel();
+  let timeout;
+  try {
+    await Promise.race([aborted, new Promise((_, reject) => {
+      timeout = setTimeout(() => reject(new Error("Speech synthesis was not aborted on disconnect")), 1000);
+    })]);
+  } finally {
+    clearTimeout(timeout);
+  }
+});
