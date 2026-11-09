@@ -27,18 +27,20 @@ Voraussetzung: Node.js ab 20.6.
 `npm start` verwendet bereits gesetzte Umgebungsvariablen und liest keine `.env`
 automatisch ein. Der Port ist über `PORT` einstellbar (Standard: `3000`).
 
-## Groq vorbereiten und bestehende Konfiguration erhalten
+## KI-Anbieter und bestehende Konfiguration
 
-Der vorhandene `openai`-Client unterstützt auch Groqs OpenAI-kompatiblen Endpunkt;
-ein zweites SDK ist nicht erforderlich.
+Der vorhandene `openai`-Client unterstützt auch die OpenAI-kompatiblen Endpunkte
+von Groq und Google Gemini. Ein zusätzliches SDK ist nicht erforderlich.
 
 | Variable | Bedeutung |
 | --- | --- |
-| `AI_PROVIDER` | Optional `groq` oder `openai`. Ohne Vorgabe: Groq bei vorhandenem `GROQ_API_KEY`, sonst OpenAI bei vorhandenem `OPENAI_API_KEY`. |
+| `AI_PROVIDER` | Optional `groq`, `openai` oder `gemini`. Ohne Vorgabe: Groq, danach OpenAI, danach Gemini, jeweils nur mit vorhandenem Schlüssel. |
 | `GROQ_API_KEY` | Groq-Schlüssel, nur serverseitig hinterlegen. |
 | `GROQ_MODEL` | Optional, Standard `llama-3.3-70b-versatile`. |
 | `OPENAI_API_KEY` | Bestehender OpenAI-Schlüssel bleibt weiterhin nutzbar. |
 | `OPENAI_MODEL` | Optional, Standard `gpt-4o-mini`. |
+| `GEMINI_API_KEY` | Gemini-Schlüssel, ausschließlich serverseitig hinterlegen. |
+| `GEMINI_MODEL` | Optional, Standard `gemini-3.8-flash`. |
 | `JARVIS_PASSWORD` | Bestehendes Passwort, 16 bis 256 Zeichen. |
 | `ALLOWED_ORIGINS` | Optional, erlaubte Browser-Ursprünge, durch Kommas getrennt. Standard: `https://manuellaski-gif.github.io`. |
 | `TRUST_PROXY` | Zahl vertrauenswürdiger Proxy-Hops, Standard `0`. |
@@ -47,6 +49,29 @@ Eine bestehende Installation mit `OPENAI_API_KEY` und `JARVIS_PASSWORD` bleibt
 funktionsfähig. Es werden keine Schlüssel erzeugt, gelöscht oder verändert.
 Bei explizitem `AI_PROVIDER=groq` muss `GROQ_API_KEY` gesetzt sein. Es gibt keinen
 automatischen Anbieterwechsel bei Fehlern während einer Anfrage.
+
+### Google Gemini aktivieren
+
+1. In [Google AI Studio](https://aistudio.google.com/apikey) einen persönlichen
+   API-Schlüssel erstellen oder einen bereits vorhandenen passenden Schlüssel
+   verwenden. Den Schlüssel niemals in Chat, Git oder HTML eintragen.
+2. In der geschützten Umgebung des bestehenden Servers `GEMINI_API_KEY`
+   hinterlegen und `AI_PROVIDER=gemini` setzen. Bestehende Passwörter und
+   Schlüssel anderer Anbieter unverändert lassen.
+3. Die Version mit Gemini-Unterstützung deployen. Das bloße Speichern einer
+   Variable aktiviert sie noch nicht im laufenden Prozess. Ein älterer Build
+   ohne Gemini-Unterstützung kann `AI_PROVIDER=gemini` nicht verarbeiten.
+
+`gemini-3.8-flash` wird in der zum Implementierungszeitpunkt geprüften
+[Google-Preisliste](https://aistudio.google.com/docs/pricing) mit kostenlosem
+Kontingent für Ein- und Ausgabetokens geführt. Modellzugang und Kontolimits
+müssen im eigenen Google-Konto verfügbar sein. Eine bezahlte Abrechnung wird
+durch diesen Code nicht eingerichtet. Der Server verwendet den dokumentierten
+[OpenAI-kompatiblen Endpunkt](https://aistudio.google.com/docs/openai).
+
+Wenn zusätzlich noch ein OpenAI-Schlüssel existiert, ist die explizite Vorgabe
+`AI_PROVIDER=gemini` erforderlich, um Gemini zu wählen. So bleibt das Verhalten
+bereits bestehender OpenAI-Installationen unverändert.
 
 Groq bietet je nach Konto ein kostenloses Kontingent mit Anfrage- und Tokenlimits.
 Das ist keine Zusage unbegrenzter kostenloser Nutzung. Vor einer späteren
@@ -71,7 +96,8 @@ Dieses Projekt wird weiterhin getrennt betrieben: GitHub Pages liefert
 `index.html`, Render oder ein anderer Node-Host liefert die API. Das Veröffentlichen
 der HTML-Dateien allein startet keinen Node-Server.
 
-- Vor jedem Deployment ist die Zustimmung des Nutzers erforderlich.
+- Deployments erfolgen im vom Nutzer freigegebenen Rahmen; bereits erteilte
+  Zustimmungen im Gespräch gelten weiter.
 - Geheimnisse nur in der geschützten Umgebung des Server-Hosts verwalten.
   `.env` ist lokal und wird von Git ignoriert. Nie Schlüssel ins HTML eintragen.
 - Bei geändertem Frontend-Host `ALLOWED_ORIGINS` entsprechend setzen; CORS ersetzt
@@ -87,4 +113,4 @@ der HTML-Dateien allein startet keinen Node-Server.
 - Sprachfunktionen hängen vom Browser und dessen Berechtigungen ab. Die Webseite
   kann den nativen iPhone-Kalender nicht direkt steuern; sie öffnet Google Calendar.
 
-Es wurde kein Deployment ausgelöst und keine Zugangsdatenkonfiguration verändert.
+Die Anwendung erzeugt oder verändert keine Zugangsdaten automatisch.

@@ -6,12 +6,30 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 export function createApp({ env = process.env, fetch: providerFetch } = {}) {
   const provider = env.AI_PROVIDER?.trim().toLowerCase() ||
-    (env.GROQ_API_KEY?.trim() ? "groq" : env.OPENAI_API_KEY?.trim() ? "openai" : "groq");
-  if (!["groq", "openai"].includes(provider)) {
-    throw new Error("AI_PROVIDER muss groq oder openai sein.");
+    (env.GROQ_API_KEY?.trim() ? "groq" : env.OPENAI_API_KEY?.trim() ? "openai" :
+      env.GEMINI_API_KEY?.trim() ? "gemini" : "groq");
+  const providers = {
+    groq: {
+      keyName: "GROQ_API_KEY",
+      baseURL: "https://api.groq.com/openai/v1",
+      model: env.GROQ_MODEL?.trim() || "llama-3.3-70b-versatile"
+    },
+    openai: {
+      keyName: "OPENAI_API_KEY",
+      baseURL: "https://api.openai.com/v1",
+      model: env.OPENAI_MODEL?.trim() || "gpt-4o-mini"
+    },
+    gemini: {
+      keyName: "GEMINI_API_KEY",
+      baseURL: "https://generativelanguage.googleapis.com/v1beta/openai/",
+      model: env.GEMINI_MODEL?.trim() || "gemini-3.8-flash"
+    }
+  };
+  if (!Object.hasOwn(providers, provider)) {
+    throw new Error("AI_PROVIDER muss groq, openai oder gemini sein.");
   }
 
-  const keyName = provider === "groq" ? "GROQ_API_KEY" : "OPENAI_API_KEY";
+  const { keyName, baseURL, model } = providers[provider];
   const apiKey = env[keyName]?.trim();
   if (!apiKey) throw new Error(`${keyName} fehlt.`);
 
@@ -27,14 +45,11 @@ export function createApp({ env = process.env, fetch: providerFetch } = {}) {
 
   const client = new OpenAI({
     apiKey,
-    baseURL: provider === "groq" ? "https://api.groq.com/openai/v1" : "https://api.openai.com/v1",
+    baseURL,
     timeout: 30000,
     maxRetries: 0,
     ...(providerFetch ? { fetch: providerFetch } : {})
   });
-  const model = provider === "groq"
-    ? env.GROQ_MODEL?.trim() || "llama-3.3-70b-versatile"
-    : env.OPENAI_MODEL?.trim() || "gpt-4o-mini";
   const allowedOrigins = (env.ALLOWED_ORIGINS || "https://manuellaski-gif.github.io")
     .split(",").map(origin => origin.trim()).filter(Boolean);
 
@@ -128,7 +143,10 @@ export function createApp({ env = process.env, fetch: providerFetch } = {}) {
           },
           { role: "user", content: message.trim() }
         ],
-        max_tokens: 400
+        // Leave room for Gemini's thinking as well as the visible answer.
+        ...(provider === "gemini"
+          ? { max_tokens: 2048, reasoning_effort: "low" }
+          : { max_tokens: 400 })
       });
 
       const reply = response.choices?.[0]?.message?.content;

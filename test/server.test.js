@@ -68,6 +68,7 @@ test("startup validates provider, credentials, password bounds and proxy configu
   assert.throws(() => createApp({ env: {} }), /GROQ_API_KEY fehlt/);
   assert.throws(() => createApp({ env: { ...baseEnv, AI_PROVIDER: "other" } }), /AI_PROVIDER/);
   assert.throws(() => createApp({ env: { ...baseEnv, AI_PROVIDER: "openai" } }), /OPENAI_API_KEY fehlt/);
+  assert.throws(() => createApp({ env: { ...baseEnv, AI_PROVIDER: "gemini" } }), /GEMINI_API_KEY fehlt/);
   for (const password of [undefined, "", "x".repeat(15), "x".repeat(257)]) {
     assert.throws(() => createApp({ env: { ...baseEnv, JARVIS_PASSWORD: password } }), /JARVIS_PASSWORD/);
   }
@@ -99,6 +100,7 @@ test("health and public app work without serving project or credential files", a
 test("real SDK serializes Groq endpoint, key, model and chat message", async t => {
   const { request, login, upstreamRequests } = await start(t, {
     OPENAI_API_KEY: "synthetic-unused-openai-key",
+    GEMINI_API_KEY: "synthetic-unused-gemini-key",
     GROQ_MODEL: "test-groq-model"
   });
   const token = await login();
@@ -111,6 +113,7 @@ test("real SDK serializes Groq endpoint, key, model and chat message", async t =
   assert.equal(upstreamRequests[0].authorization, "Bearer synthetic-groq-test-key");
   assert.equal(upstreamRequests[0].body.model, "test-groq-model");
   assert.equal(upstreamRequests[0].body.max_tokens, 400);
+  assert.equal(upstreamRequests[0].body.reasoning_effort, undefined);
   assert.equal(upstreamRequests[0].body.messages[0].role, "system");
   assert.deepEqual(upstreamRequests[0].body.messages[1], { role: "user", content: "Hallo" });
 });
@@ -126,7 +129,8 @@ test("Groq uses its default model when no override is configured", async t => {
 test("existing OpenAI configuration remains usable without a Groq key", async t => {
   const { request, login, upstreamRequests } = await start(t, {
     GROQ_API_KEY: undefined,
-    OPENAI_API_KEY: "synthetic-openai-test-key"
+    OPENAI_API_KEY: "synthetic-openai-test-key",
+    GEMINI_API_KEY: "synthetic-unused-gemini-key"
   });
   const response = await request("/api/chat", { token: await login(), body: { message: "Hallo" } });
   assert.equal(response.status, 200);
@@ -134,12 +138,48 @@ test("existing OpenAI configuration remains usable without a Groq key", async t 
   assert.equal(upstreamRequests[0].url, "https://api.openai.com/v1/chat/completions");
   assert.equal(upstreamRequests[0].authorization, "Bearer synthetic-openai-test-key");
   assert.equal(upstreamRequests[0].body.model, "gpt-4o-mini");
+  assert.equal(upstreamRequests[0].body.max_tokens, 400);
+  assert.equal(upstreamRequests[0].body.reasoning_effort, undefined);
+});
+
+test("Gemini alone uses the documented OpenAI-compatible endpoint and default model", async t => {
+  const { request, login, upstreamRequests } = await start(t, {
+    GROQ_API_KEY: undefined,
+    GEMINI_API_KEY: "synthetic-gemini-test-key"
+  });
+  const response = await request("/api/chat", { token: await login(), body: { message: "  Hallo  " } });
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { reply: "Hallo, Boss." });
+  assert.equal(upstreamRequests.length, 1);
+  assert.equal(upstreamRequests[0].url, "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions");
+  assert.equal(upstreamRequests[0].authorization, "Bearer synthetic-gemini-test-key");
+  assert.equal(upstreamRequests[0].body.model, "gemini-3.8-flash");
+  assert.equal(upstreamRequests[0].body.max_tokens, 2048);
+  assert.equal(upstreamRequests[0].body.reasoning_effort, "low");
+  assert.equal(upstreamRequests[0].body.messages[0].role, "system");
+  assert.deepEqual(upstreamRequests[0].body.messages[1], { role: "user", content: "Hallo" });
+});
+
+test("explicit Gemini selection overrides existing keys and supports a custom model", async t => {
+  const { request, login, upstreamRequests } = await start(t, {
+    AI_PROVIDER: "gemini",
+    OPENAI_API_KEY: "synthetic-unused-openai-key",
+    GEMINI_API_KEY: "synthetic-selected-gemini-key",
+    GEMINI_MODEL: "test-gemini-model"
+  });
+  const response = await request("/api/chat", { token: await login(), body: { message: "Hallo" } });
+  assert.equal(response.status, 200);
+  await response.json();
+  assert.equal(upstreamRequests[0].url, "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions");
+  assert.equal(upstreamRequests[0].authorization, "Bearer synthetic-selected-gemini-key");
+  assert.equal(upstreamRequests[0].body.model, "test-gemini-model");
 });
 
 test("explicit provider selection and OpenAI model override take precedence", async t => {
   const { request, login, upstreamRequests } = await start(t, {
     AI_PROVIDER: "openai",
     OPENAI_API_KEY: "synthetic-selected-openai-key",
+    GEMINI_API_KEY: "synthetic-unused-gemini-key",
     OPENAI_MODEL: "test-openai-model"
   });
   const response = await request("/api/chat", { token: await login(), body: { message: "Hallo" } });
