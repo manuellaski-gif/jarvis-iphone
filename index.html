@@ -40,6 +40,11 @@ button{border:0;border-radius:12px;background:#df3153;color:white;padding:14px;f
 .actions span{display:block;font-size:20px;margin-bottom:6px}
 .foot{color:#7c8295;font-size:11px;text-align:center;margin-top:24px}
 button:disabled{opacity:.55}
+.voice-controls{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:8px;align-items:end;margin-top:14px}
+.voice-controls label{font-size:12px;color:#a7a9b8}
+.voice-controls select{display:block;width:100%;min-width:0;margin-top:5px;padding:10px 8px;border:1px solid #343747;border-radius:10px;background:#161a27;color:#f5f5f7;font:inherit;font-size:14px}
+.voice-controls button{padding:11px 9px;background:#292035;font-size:12px}
+.voice-note{min-height:18px;margin:8px 0 0;color:#a7a9b8;font-size:12px;line-height:1.5}
 </style>
 </head>
 <body>
@@ -72,10 +77,23 @@ button:disabled{opacity:.55}
   </section>
 
   <form class="controls" id="form">
-    <input id="command" placeholder="Was soll ich tun, Boss?" aria-label="Befehl" autocomplete="off">
+    <input id="command" placeholder="Was soll ich tun, Boss?" aria-label="Befehl" autocomplete="off" maxlength="2000">
     <button type="submit" aria-label="Senden">➤</button>
     <button type="button" class="mic" id="mic" aria-label="Sprachbefehl">🎙</button>
   </form>
+
+  <div class="voice-controls">
+    <label for="voiceMode">Stimme
+      <select id="voiceMode">
+        <option value="natural">Natürlich</option>
+        <option value="device">Gerätestimme</option>
+        <option value="off">Aus</option>
+      </select>
+    </label>
+    <button type="button" id="readButton">Vorlesen</button>
+    <button type="button" id="stopButton">Stopp</button>
+  </div>
+  <p class="voice-note" id="voiceStatus" role="status" aria-live="polite"></p>
 
   <div class="actions">
     <button type="button" data-cmd="Wie spät ist es?"><span>🕒</span>Uhrzeit</button>
@@ -88,7 +106,8 @@ button:disabled{opacity:.55}
 </main>
 
 <script>
-const API = "https://jarvis-iphone-qxi0.onrender.com";
+const localHost = ["localhost", "127.0.0.1", "[::1]", "::1"].includes(window.location.hostname);
+const API = localHost ? "" : "https://jarvis-iphone-qxi0.onrender.com";
 const input = document.querySelector("#command");
 const reply = document.querySelector("#reply");
 const headline = document.querySelector("#headline");
@@ -97,8 +116,48 @@ const loginPanel = document.querySelector("#loginPanel");
 const passwordInput = document.querySelector("#password");
 const loginButton = document.querySelector("#loginButton");
 const loginNote = document.querySelector("#loginNote");
+const commandButtons = document.querySelectorAll("#form button, [data-cmd]");
+const micButton = document.querySelector("#mic");
+const voiceMode = document.querySelector("#voiceMode");
+const voiceStatus = document.querySelector("#voiceStatus");
+const readButton = document.querySelector("#readButton");
+const stopButton = document.querySelector("#stopButton");
 
-let token = sessionStorage.getItem("jarvis_session") || "";
+function storedToken() {
+  try { return sessionStorage.getItem("jarvis_session") || ""; }
+  catch { return ""; }
+}
+
+function storeToken(value) {
+  try {
+    if (value) sessionStorage.setItem("jarvis_session", value);
+    else sessionStorage.removeItem("jarvis_session");
+  } catch { /* Chat remains available without browser storage. */ }
+}
+
+function storedVoiceMode() {
+  try {
+    const value = localStorage.getItem("jarvis_voice_mode");
+    if (["natural", "device", "off"].includes(value)) return value;
+  } catch { /* The preference is optional. */ }
+  return "natural";
+}
+
+let token = storedToken();
+let loginBusy = false;
+let chatBusy = false;
+let listening = false;
+let latestReply = "";
+let activeChatController = null;
+let speechController = null;
+let speechGeneration = 0;
+let speechPending = false;
+let activeUtterance = null;
+let audioContext = null;
+let audioResume = null;
+let audioScheduleTime = 0;
+const audioSources = new Set();
+voiceMode.value = storedVoiceMode();
 
 function setLoginState(loggedIn) {
   loginPanel.hidden = loggedIn;
@@ -106,169 +165,535 @@ function setLoginState(loggedIn) {
   headline.textContent = loggedIn ? "Bereit für deine Befehle" : "JARVIS gesperrt";
 }
 
+function updateControls() {
+  const busy = loginBusy || chatBusy;
+  loginButton.disabled = busy;
+  passwordInput.disabled = loginBusy;
+  input.disabled = busy;
+  commandButtons.forEach(button => { button.disabled = busy; });
+  micButton.disabled = busy || listening;
+  readButton.disabled = !latestReply || busy || voiceMode.value === "off";
+  stopButton.disabled = !chatBusy && !speechPending && !activeUtterance && audioSources.size === 0;
+}
+
+function voiceReadyNote() {
+  if (voiceMode.value === "off") return "Sprachausgabe aus.";
+  if (voiceMode.value === "device") return "Gerätestimme ausgewählt.";
+  return token ? "Natürliche Stimme bereit." : "Für die natürliche Stimme bitte anmelden.";
+}
+
+function expireSession() {
+  token = "";
+  storeToken("");
+  setLoginState(false);
+  loginNote.textContent = "Bitte melde dich erneut an.";
+}
+
+function stopAudioSources() {
+  for (const source of audioSources) {
+    try { source.stop(); } catch { /* A finished source can no longer be stopped. */ }
+  }
+  audioSources.clear();
+  audioScheduleTime = 0;
+}
+
+function cancelSpeech(note = "") {
+  speechGeneration += 1;
+  speechController?.abort();
+  speechController = null;
+  speechPending = false;
+  stopAudioSources();
+  activeUtterance = null;
+  try { window.speechSynthesis?.cancel(); } catch { /* Speech is optional. */ }
+  if (note) voiceStatus.textContent = note;
+  updateControls();
+}
+
+function stopOutput() {
+  activeChatController?.abort();
+  cancelSpeech("Sprachausgabe gestoppt.");
+}
+
+// Resume during the original tap, before waiting for a remote answer (iOS).
+function prepareAudio() {
+  if (voiceMode.value !== "natural" || !token) return;
+  try {
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextClass) return;
+    audioContext ||= new AudioContextClass();
+    if (audioContext.state !== "running") {
+      audioResume = Promise.resolve(audioContext.resume()).catch(() => {});
+    }
+  } catch { /* A later Vorlesen tap can retry audio activation. */ }
+}
+
+function speechText(text) {
+  const clean = text.replace(/[*_`#]/g, "").replace(/\s+/g, " ").trim();
+  if (clean.length <= 1200) return clean;
+  const prefix = clean.slice(0, 1200).replace(/[\uD800-\uDBFF]$/u, "");
+  const sentenceEnds = [...prefix.matchAll(/[.!?](?:\s|$)/gu)];
+  if (sentenceEnds.length) return prefix.slice(0, sentenceEnds.at(-1).index + 1);
+  const space = prefix.lastIndexOf(" ");
+  return prefix.slice(0, space > 0 ? space : prefix.length);
+}
+
+function bestDeviceVoice() {
+  const voices = window.speechSynthesis?.getVoices?.() || [];
+  return voices.filter(voice => /^de(?:[-_]|$)/i.test(voice.lang))
+    .map(voice => ({ voice, score:
+      (/premium/i.test(voice.name) ? 40 : 0) +
+      (/enhanced|erweitert|neural|natural|natürlich/i.test(voice.name) ? 30 : 0) +
+      (voice.localService ? 5 : 0) + (/^de[-_]DE$/i.test(voice.lang) ? 2 : 0)
+    }))
+    .sort((a, b) => b.score - a.score)[0]?.voice || null;
+}
+
+function speakDevice(text, generation) {
+  try {
+    const synth = window.speechSynthesis;
+    if (!synth) throw new Error("Keine Gerätestimme verfügbar.");
+    const utterance = new SpeechSynthesisUtterance(text);
+    const voice = bestDeviceVoice();
+    if (voice) utterance.voice = voice;
+    utterance.lang = voice?.lang || "de-DE";
+    utterance.rate = 1;
+    utterance.pitch = 1;
+    activeUtterance = utterance;
+    utterance.onend = () => {
+      if (generation !== speechGeneration) return;
+      activeUtterance = null;
+      voiceStatus.textContent = voiceReadyNote();
+      updateControls();
+    };
+    utterance.onerror = () => {
+      if (generation !== speechGeneration) return;
+      activeUtterance = null;
+      voiceStatus.textContent = "Gerätestimme nicht verfügbar. Tippe auf Vorlesen, um es erneut zu versuchen.";
+      updateControls();
+    };
+    synth.speak(utterance);
+    voiceStatus.textContent = voice ? "Gerätestimme: " + voice.name : "Gerätestimme spricht …";
+    updateControls();
+  } catch {
+    activeUtterance = null;
+    voiceStatus.textContent = "Keine Gerätestimme verfügbar. Die Textantwort bleibt sichtbar.";
+    updateControls();
+  }
+}
+
+function abortedError() {
+  const error = new Error("Anfrage gestoppt.");
+  error.name = "AbortError";
+  return error;
+}
+
+async function readSseEvents(response, onEvent, signal) {
+  if (!response.body?.getReader) throw new Error("Diese Antwort kann nicht gestreamt werden.");
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let pending = "";
+  const cancelReader = () => { reader.cancel().catch(() => {}); };
+  signal.addEventListener("abort", cancelReader, { once: true });
+  async function dispatch(frame) {
+    let event = "message";
+    const data = [];
+    for (const line of frame.split(/\r\n|\n|\r/u)) {
+      if (line.startsWith("event:")) event = line.slice(6).replace(/^ /, "");
+      if (line.startsWith("data:")) data.push(line.slice(5).replace(/^ /, ""));
+    }
+    if (!data.length) return;
+    let value;
+    try { value = JSON.parse(data.join("\n")); }
+    catch { throw new Error("Der Server hat keine gültige Antwort gesendet."); }
+    await onEvent(event, value);
+  }
+  try {
+    while (true) {
+      if (signal.aborted) throw abortedError();
+      const chunk = await reader.read();
+      if (signal.aborted) throw abortedError();
+      pending += decoder.decode(chunk.value, { stream: !chunk.done });
+      let boundary;
+      while ((boundary = /\r\n\r\n|\n\n|\r\r/u.exec(pending))) {
+        const frame = pending.slice(0, boundary.index);
+        pending = pending.slice(boundary.index + boundary[0].length);
+        await dispatch(frame);
+      }
+      if (chunk.done) break;
+    }
+    if (pending.trim()) await dispatch(pending);
+  } finally {
+    signal.removeEventListener("abort", cancelReader);
+    try { await reader.cancel(); } catch { /* Fetch may already have been aborted. */ }
+    reader.releaseLock();
+  }
+}
+
+async function responseData(response) {
+  try {
+    const data = await response.json();
+    if (data && typeof data === "object" && !Array.isArray(data)) return data;
+  } catch { /* Hosting errors can return HTML instead of JSON. */ }
+  if (response.ok) throw new Error("Der Server hat keine gültige Antwort gesendet.");
+  return {};
+}
+
+function serverError(data, fallback) {
+  const error = new Error(typeof data?.error === "string" ? data.error : fallback);
+  error.status = data?.status;
+  return error;
+}
+
+function queueAudioBuffer(buffer, generation) {
+  if (generation !== speechGeneration) return;
+  if (!audioContext || audioContext.state !== "running") {
+    throw new Error("Tippe auf Vorlesen, um die natürliche Stimme zu starten.");
+  }
+  const source = audioContext.createBufferSource();
+  source.buffer = buffer;
+  source.connect(audioContext.destination);
+  const firstChunk = audioSources.size === 0 && audioScheduleTime === 0;
+  const start = Math.max(audioScheduleTime, audioContext.currentTime + (firstChunk ? 0.12 : 0.04));
+  audioScheduleTime = start + buffer.duration;
+  audioSources.add(source);
+  source.onended = () => {
+    audioSources.delete(source);
+    if (generation === speechGeneration && !speechPending && audioSources.size === 0) {
+      voiceStatus.textContent = voiceReadyNote();
+    }
+    updateControls();
+  };
+  source.start(start);
+  voiceStatus.textContent = "Natürliche Stimme spricht …";
+  updateControls();
+}
+
+async function naturalSpeech(text, generation, controller) {
+  await audioResume;
+  if (generation !== speechGeneration || controller.signal.aborted) return;
+  if (!audioContext || audioContext.state !== "running") {
+    throw new Error("Tippe auf Vorlesen, um die natürliche Stimme zu starten.");
+  }
+  const response = await fetch(API + "/api/speech", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Accept": "text/event-stream", "Authorization": "Bearer " + token },
+    body: JSON.stringify({ text }),
+    signal: controller.signal
+  });
+  if (generation !== speechGeneration || controller.signal.aborted) return;
+  if (!response.ok) {
+    const data = await responseData(response);
+    if (response.status === 401) expireSession();
+    throw serverError(data, "Natürliche Stimme gerade nicht verfügbar. Bitte später erneut versuchen.");
+  }
+  let received = false;
+  if ((response.headers?.get("Content-Type") || "").includes("text/event-stream")) {
+    let carry = new Uint8Array(0);
+    let finished = false;
+    await readSseEvents(response, (event, data) => {
+      if (generation !== speechGeneration || controller.signal.aborted) return;
+      if (event === "error") throw serverError(data, "Natürliche Stimme gerade nicht verfügbar.");
+      if (event === "done") { finished = true; return; }
+      if (event !== "audio") return;
+      if (data.format !== "pcm_s16le" || data.sampleRate !== 24000 || typeof data.data !== "string") {
+        throw new Error("Die Sprachausgabe hat ein unbekanntes Audioformat.");
+      }
+      const decoded = atob(data.data);
+      const bytes = new Uint8Array(carry.length + decoded.length);
+      bytes.set(carry);
+      for (let i = 0; i < decoded.length; i += 1) bytes[carry.length + i] = decoded.charCodeAt(i);
+      const length = bytes.length - bytes.length % 2;
+      carry = bytes.slice(length);
+      if (!length) return;
+      const samples = new DataView(bytes.buffer, bytes.byteOffset, length);
+      const buffer = audioContext.createBuffer(1, length / 2, data.sampleRate);
+      const channel = buffer.getChannelData(0);
+      for (let i = 0; i < channel.length; i += 1) channel[i] = samples.getInt16(i * 2, true) / 32768;
+      queueAudioBuffer(buffer, generation);
+      received = true;
+    }, controller.signal);
+    if (!finished || carry.length) throw new Error("Die Sprachausgabe wurde unterbrochen. Du kannst sie erneut vorlesen lassen.");
+  } else if ((response.headers?.get("Content-Type") || "").includes("audio/")) {
+    const buffer = await audioContext.decodeAudioData(await response.arrayBuffer());
+    if (generation !== speechGeneration || controller.signal.aborted) return;
+    queueAudioBuffer(buffer, generation);
+    received = true;
+  } else {
+    const data = await responseData(response);
+    throw serverError(data, "Natürliche Stimme gerade nicht verfügbar.");
+  }
+  if (!received) throw new Error("Keine Sprachausgabe erhalten. Bitte erneut versuchen.");
+}
+
 function speak(text) {
-  if (!("speechSynthesis" in window)) return;
-  speechSynthesis.cancel();
-  const utterance = new SpeechSynthesisUtterance(text);
-  utterance.lang = "de-DE";
-  utterance.rate = 0.94;
-  utterance.pitch = 1.08;
-  speechSynthesis.speak(utterance);
+  cancelSpeech();
+  const generation = speechGeneration;
+  const content = speechText(text);
+  if (!content || voiceMode.value === "off") {
+    voiceStatus.textContent = voiceReadyNote();
+    return Promise.resolve();
+  }
+  if (voiceMode.value === "device") {
+    speakDevice(content, generation);
+    return Promise.resolve();
+  }
+  if (!token) {
+    voiceStatus.textContent = voiceReadyNote();
+    return Promise.resolve();
+  }
+  prepareAudio();
+  const controller = new AbortController();
+  speechController = controller;
+  speechPending = true;
+  voiceStatus.textContent = "Natürliche Stimme wird vorbereitet …";
+  updateControls();
+  const timeout = setTimeout(() => controller.abort(), 45000);
+  return naturalSpeech(content, generation, controller).catch(error => {
+    if (generation !== speechGeneration) return;
+    stopAudioSources();
+    controller.abort();
+    voiceStatus.textContent = error.name === "AbortError"
+      ? "Natürliche Stimme braucht gerade zu lange. Bitte erneut auf Vorlesen tippen."
+      : error.message || "Natürliche Stimme gerade nicht verfügbar. Die Textantwort bleibt sichtbar.";
+  }).finally(() => {
+    clearTimeout(timeout);
+    if (generation !== speechGeneration) return;
+    speechController = null;
+    speechPending = false;
+    updateControls();
+  });
+}
+
+async function apiRequest(path, options) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 45000);
+  try {
+    const response = await fetch(API + path, { ...options, signal: controller.signal });
+    const data = await responseData(response);
+    if (controller.signal.aborted) throw abortedError();
+    return { response, data };
+  } catch (error) {
+    if (controller.signal.aborted) throw new Error("Der Server antwortet nicht rechtzeitig. Bitte erneut versuchen.");
+    if (error.name === "TypeError") throw new Error("Server nicht erreichbar. Bitte erneut versuchen.");
+    throw error;
+  } finally { clearTimeout(timeout); }
 }
 
 async function login() {
+  if (loginBusy || chatBusy) return;
   const password = passwordInput.value;
-  if (!password) {
-    loginNote.textContent = "Bitte gib dein Passwort ein.";
-    return;
-  }
-
-  loginButton.disabled = true;
+  if (!password) { loginNote.textContent = "Bitte gib dein Passwort ein."; return; }
+  loginBusy = true;
+  updateControls();
   loginNote.textContent = "Anmeldung wird geprüft …";
-
   try {
-    const response = await fetch(API + "/api/login", {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({password})
+    const { response, data } = await apiRequest("/api/login", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ password })
     });
-
-    const data = await response.json();
-
-    if (!response.ok || !data.token) {
+    if (!response.ok || typeof data.token !== "string" || !data.token) {
       throw new Error(data.error || "Anmeldung fehlgeschlagen.");
     }
-
     token = data.token;
-    sessionStorage.setItem("jarvis_session", token);
+    storeToken(token);
     passwordInput.value = "";
     loginNote.textContent = "";
     setLoginState(true);
     reply.textContent = "Verbindung hergestellt. Ich bin bereit, Boss.";
-    speak(reply.textContent);
+    voiceStatus.textContent = voiceReadyNote();
   } catch (error) {
-    loginNote.textContent = error.message ||
-      "Server nicht erreichbar. Bitte erneut versuchen.";
+    loginNote.textContent = error.message || "Server nicht erreichbar. Bitte erneut versuchen.";
   } finally {
-    loginButton.disabled = false;
+    loginBusy = false;
+    updateControls();
+  }
+}
+
+async function requestChat(command, onText) {
+  const controller = new AbortController();
+  activeChatController = controller;
+  let timedOut = false;
+  const timeout = setTimeout(() => { timedOut = true; controller.abort(); }, 45000);
+  try {
+    const response = await fetch(API + "/api/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Accept": "text/event-stream", "Authorization": "Bearer " + token },
+      body: JSON.stringify({ message: command, stream: true }),
+      signal: controller.signal
+    });
+    if (!response.ok) {
+      const data = await responseData(response);
+      if (response.status === 401) { expireSession(); throw new Error("Deine Sitzung ist abgelaufen."); }
+      throw serverError(data, "KI-Anfrage fehlgeschlagen. Bitte erneut versuchen.");
+    }
+    if (!(response.headers?.get("Content-Type") || "").includes("text/event-stream")) {
+      const data = await responseData(response);
+      if (controller.signal.aborted) throw abortedError();
+      return typeof data.reply === "string" && data.reply.trim() ? data.reply : "Keine Antwort erhalten.";
+    }
+    let text = "";
+    let finished = false;
+    await readSseEvents(response, (event, data) => {
+      if (event === "delta" && typeof data.text === "string") {
+        text += data.text;
+        onText(text);
+      } else if (event === "done") {
+        if (typeof data.reply === "string" && data.reply.trim()) text = data.reply;
+        finished = true;
+      } else if (event === "error") {
+        if (data.status === 401) expireSession();
+        throw serverError(data, "Die KI-Antwort wurde unterbrochen. Bitte erneut versuchen.");
+      }
+    }, controller.signal);
+    if (!finished) throw new Error("Die KI-Antwort wurde unterbrochen. Bitte erneut versuchen.");
+    return text || "Keine Antwort erhalten.";
+  } catch (error) {
+    if (controller.signal.aborted) {
+      if (timedOut) throw new Error("Der Server antwortet nicht rechtzeitig. Bitte erneut versuchen.");
+      throw abortedError();
+    }
+    if (error.name === "TypeError") throw new Error("Server nicht erreichbar. Bitte erneut versuchen.");
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+    if (activeChatController === controller) activeChatController = null;
+  }
+}
+
+function showReply(text, title = "Antwort bereit") {
+  reply.textContent = text;
+  latestReply = text;
+  headline.textContent = title;
+  updateControls();
+  void speak(text);
+}
+
+async function answer(command) {
+  if (loginBusy || chatBusy) return;
+  const q = command.toLowerCase().trim().replace(/\s+/g, " ");
+  if (!q) return;
+  cancelSpeech();
+  prepareAudio();
+  if (/^(?:hilfe|was kannst du(?: für mich tun)?)[?!.]*$/u.test(q)) {
+    showReply("Ich beantworte Fragen, sammle Ideen und helfe beim Formulieren. Uhrzeit, Datum und Hilfe beantworte ich sofort. Mit „Öffne Kalender“ oder „Öffne Google“ öffnest du die jeweilige Webseite.");
+    return;
+  }
+  if (/^(?:datum|welches datum(?: ist heute)?|welcher tag(?: ist heute)?|was ist heute für ein tag)[?!.]*$/u.test(q)) {
+    showReply("Heute ist " + new Date().toLocaleDateString("de-CH", {
+      weekday: "long", day: "numeric", month: "long", year: "numeric"
+    }) + ".");
+    return;
+  }
+  if (/^(?:uhrzeit|uhr|wie spät(?: ist es)?|wie viel uhr(?: ist es)?)[?!.]*$/u.test(q)) {
+    showReply("Boss, es ist " + new Date().toLocaleTimeString("de-CH", { hour: "2-digit", minute: "2-digit" }) + " Uhr.");
+    return;
+  }
+  if (/^(?:öffne google|google öffnen)[?!.]*$/u.test(q)) {
+    window.open("https://www.google.com/", "_blank", "noopener,noreferrer");
+    showReply("Ich öffne Google, Boss.", "Befehl verarbeitet");
+    return;
+  }
+  if (/^(?:öffne (?:den )?kalender|kalender öffnen)[?!.]*$/u.test(q)) {
+    window.open("https://calendar.google.com/", "_blank", "noopener,noreferrer");
+    showReply("Ich öffne Google Kalender im Browser, Boss.", "Befehl verarbeitet");
+    return;
+  }
+  if (!token) {
+    loginNote.textContent = "Bitte melde dich zuerst an.";
+    passwordInput.focus();
+    voiceStatus.textContent = voiceReadyNote();
+    return;
+  }
+  chatBusy = true;
+  updateControls();
+  headline.textContent = "JARVIS denkt nach …";
+  reply.textContent = "Einen Moment, Boss …";
+  let partial = "";
+  try {
+    const text = await requestChat(command, text => {
+      partial = text;
+      reply.textContent = text;
+      headline.textContent = "JARVIS antwortet …";
+    });
+    showReply(text);
+  } catch (error) {
+    if (partial) {
+      reply.textContent = partial;
+      latestReply = partial;
+    } else {
+      reply.textContent = error.message || "Verbindung zum JARVIS-Server fehlgeschlagen.";
+    }
+    headline.textContent = error.name === "AbortError" ? "Anfrage gestoppt" : "Verbindung prüfen";
+    if (partial && error.name !== "AbortError") voiceStatus.textContent = error.message;
+  } finally {
+    chatBusy = false;
+    updateControls();
   }
 }
 
 loginButton.addEventListener("click", login);
 passwordInput.addEventListener("keydown", event => {
-  if (event.key === "Enter") login();
+  if (event.key === "Enter") { event.preventDefault(); login(); }
 });
-
-async function answer(command) {
-  const q = command.toLowerCase().trim();
-
-  if (/uhr|wie spät|zeit/.test(q)) {
-    const message = "Boss, es ist " +
-      new Date().toLocaleTimeString("de-CH", {
-        hour: "2-digit", minute: "2-digit"
-      }) + " Uhr.";
-    reply.textContent = message;
-    speak(message);
-    return;
-  }
-
-  if (/öffne google|google öffnen/.test(q)) {
-    window.open("https://www.google.com/", "_blank", "noopener,noreferrer");
-    reply.textContent = "Ich öffne Google, Boss.";
-    speak(reply.textContent);
-    return;
-  }
-
-  if (!token) {
-    loginNote.textContent = "Bitte melde dich zuerst an.";
-    passwordInput.focus();
-    return;
-  }
-
-  headline.textContent = "JARVIS denkt nach …";
-  reply.textContent = "Einen Moment, Boss …";
-
-  try {
-    const response = await fetch(API + "/api/chat", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": "Bearer " + token
-      },
-      body: JSON.stringify({message: command})
-    });
-
-    const data = await response.json();
-
-    if (response.status === 401) {
-      token = "";
-      sessionStorage.removeItem("jarvis_session");
-      setLoginState(false);
-      loginNote.textContent = "Bitte melde dich erneut an.";
-      throw new Error("Deine Sitzung ist abgelaufen.");
-    }
-
-    if (!response.ok) {
-      throw new Error(data.error || "KI-Anfrage fehlgeschlagen.");
-    }
-
-    reply.textContent = data.reply || "Keine Antwort erhalten.";
-    headline.textContent = "Antwort bereit";
-    speak(reply.textContent);
-  } catch (error) {
-    reply.textContent = error.message ||
-      "Verbindung zum JARVIS-Server fehlgeschlagen.";
-    headline.textContent = "Verbindung prüfen";
-  }
-}
-
 document.querySelector("#form").addEventListener("submit", event => {
   event.preventDefault();
+  if (loginBusy || chatBusy) return;
   const command = input.value.trim();
   if (!command) return;
   input.value = "";
-  answer(command);
+  void answer(command);
 });
-
 document.querySelectorAll("[data-cmd]").forEach(button => {
-  button.addEventListener("click", () => {
-    const command = button.dataset.cmd;
-    if (/kalender/i.test(command)) {
-      window.open("https://calendar.google.com/", "_blank", "noopener,noreferrer");
-      return;
-    }
-    answer(command);
-  });
+  button.addEventListener("click", () => { void answer(button.dataset.cmd); });
 });
-
-document.querySelector("#mic").addEventListener("click", () => {
+voiceMode.addEventListener("change", () => {
+  cancelSpeech();
+  try { localStorage.setItem("jarvis_voice_mode", voiceMode.value); } catch { /* Optional preference. */ }
+  voiceStatus.textContent = voiceReadyNote();
+  updateControls();
+});
+readButton.addEventListener("click", () => {
+  prepareAudio();
+  if (latestReply) void speak(latestReply);
+});
+stopButton.addEventListener("click", stopOutput);
+micButton.addEventListener("click", () => {
+  if (loginBusy || chatBusy || listening) return;
+  cancelSpeech("Ich höre zu …");
+  prepareAudio();
   const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-
   if (!Recognition) {
     reply.textContent = "Boss, die Spracherkennung wird in diesem Browser nicht unterstützt. Bitte tippe deinen Befehl ein.";
     return;
   }
-
-  const recognition = new Recognition();
-  recognition.lang = "de-DE";
-  recognition.interimResults = false;
-  headline.textContent = "Ich höre zu …";
-
-  recognition.onresult = event => {
-    const command = event.results[0][0].transcript;
-    input.value = command;
-    answer(command);
-  };
-
-  recognition.onerror = () => {
+  try {
+    const recognition = new Recognition();
+    recognition.lang = "de-DE";
+    recognition.interimResults = false;
+    listening = true;
+    updateControls();
+    headline.textContent = "Ich höre zu …";
+    recognition.onresult = event => {
+      const command = event.results[0][0].transcript;
+      input.value = command;
+      void answer(command);
+    };
+    recognition.onerror = () => {
+      headline.textContent = "Mikrofon nicht verfügbar";
+      reply.textContent = "Bitte prüfe deine Mikrofonberechtigung.";
+    };
+    recognition.onend = () => { listening = false; updateControls(); };
+    recognition.start();
+  } catch {
+    listening = false;
+    updateControls();
     headline.textContent = "Mikrofon nicht verfügbar";
-    reply.textContent = "Bitte prüfe deine Mikrofonberechtigung.";
-  };
-
-  recognition.start();
+    reply.textContent = "Spracherkennung konnte nicht gestartet werden. Bitte tippe deinen Befehl ein.";
+  }
 });
-
-setLoginState(false);
+setLoginState(Boolean(token));
+if (token) reply.textContent = "Sitzung wiederhergestellt. Ich bin bereit, Boss.";
+voiceStatus.textContent = voiceReadyNote();
+updateControls();
 </script>
 </body>
 </html>
